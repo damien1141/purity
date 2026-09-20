@@ -439,24 +439,24 @@ setup_swapfile() {
     return 0
   fi
 
-  # Remove existing swapfile if re-installing
+  # Remove existing swapfile if re-installing (only swapoff if actually active)
   local f="$MOUNT/swap/swapfile"
-  if [[ -f "$f" ]]; then
-    info "removing existing swapfile"
+  if grep -qs "$f" /proc/swaps; then
     swapoff "$f" || true
-    rm -f "$f"
   fi
+  rm -f "$f"
 
   info "creating ${SWAP_SIZE_GIB}G swapfile"
-  local f="$MOUNT/swap/swapfile"
   # Disable COW on swap directory and file
   chattr +C "$MOUNT/swap" || true
   truncate -s 0 "$f"
   chattr +C "$f"
 
-  # Prefer fallocate for speed, fallback to dd with progress
-  if ! fallocate -l "${SWAP_SIZE_GIB}G" "$f"; then
-    dd if=/dev/zero of="$f" bs=1M count=$((SWAP_SIZE_GIB * 1024)) status=progress
+  # NEVER fallocate on btrfs: it leaves prealloc/unwritten extents and swapon
+  # dies with EINVAL at first boot. btrfs mkswapfile writes real extents and
+  # sets nocow itself; dd is the portable fallback.
+  if ! btrfs filesystem mkswapfile -s "${SWAP_SIZE_GIB}G" "$f" 2>/dev/null; then
+    dd if=/dev/zero of="$f" bs=1M count=$((SWAP_SIZE_GIB * 1024)) status=progress || die "swapfile write failed"
   fi
 
   chmod 600 "$f"
@@ -483,19 +483,18 @@ strap_base() {
     pkgs+=(base)
   fi
 
-  # runit service supervisor
-  if pacman -Si runit >/dev/null 2>&1; then
-    pkgs+=(runit)
-  fi
+  # Pin init + logind + iptables providers EXPLICITLY. Bare `elogind` makes
+  # pacman prompt for init-logind providers and the default answer (1) is
+  # elogind-dinit, which pulls dinit and conflicts with runit. Bare soname
+  # dep libxtables.so likewise prompts; iptables is the sane default.
+  # elogind-runit satisfies init-logind without any prompt.
+  pkgs+=(runit elogind-runit iptables)
 
-  # elogind for logind/seat management (required for polkit, etc.)
-  if pacman -Si elogind >/dev/null 2>&1; then
-    pkgs+=(elogind)
-  fi
-
-  # Use basestrap (Artix) if available, otherwise pacstrap (Arch)
+  # Use basestrap (Artix) if available, otherwise pacstrap (Arch).
+  # No cross-fallback: on Artix pacstrap does not exist, and falling through
+  # to it masks the real basestrap error (that bug cost a full debug cycle).
   if command -v basestrap >/dev/null 2>&1; then
-    basestrap "$MOUNT" "${pkgs[@]}" || pacstrap "$MOUNT" "${pkgs[@]}" || die "basestrap/pacstrap failed"
+    basestrap "$MOUNT" "${pkgs[@]}" || die "basestrap failed (see pacman output above)"
   elif command -v pacstrap >/dev/null 2>&1; then
     pacstrap "$MOUNT" "${pkgs[@]}" || die "pacstrap failed"
   else
@@ -599,20 +598,23 @@ configure_repos() {
   [[ -f "$pacman_conf" ]] || die "pacman.conf not found in target"
   mkdir -p "$mirrorlist_dir"
 
-  # Keep the official architecture placeholders intact. Pacman expands them
-  # to x86_64_v3 or x86_64_v4 when reading each mirrorlist.
+  # Literal arch-tier paths, NOT $arch_v3/$arch_v4 variables: those variables
+  # are only expanded by CachyOS's patched pacman. Artix ships stock pacman,
+  # which would leave them unexpanded and fail the sync. $repo is standard
+  # pacman and safe. znver4 sections reuse the x86_64_v4 path (per CachyOS
+  # wiki); $repo distinguishes them.
   cat > "$mirrorlist_dir/cachyos-v3-mirrorlist" <<'EOF'
-Server = https://cdn77.cachyos.org/repo/$arch_v3/$repo
-Server = https://us.cachyos.org/repo/$arch_v3/$repo
-Server = https://at.cachyos.org/repo/$arch_v3/$repo
-Server = https://mirror.cachyos.org/repo/$arch_v3/$repo
+Server = https://cdn77.cachyos.org/repo/x86_64_v3/$repo
+Server = https://us.cachyos.org/repo/x86_64_v3/$repo
+Server = https://at.cachyos.org/repo/x86_64_v3/$repo
+Server = https://mirror.cachyos.org/repo/x86_64_v3/$repo
 EOF
 
   cat > "$mirrorlist_dir/cachyos-v4-mirrorlist" <<'EOF'
-Server = https://cdn77.cachyos.org/repo/$arch_v4/$repo
-Server = https://us.cachyos.org/repo/$arch_v4/$repo
-Server = https://at.cachyos.org/repo/$arch_v4/$repo
-Server = https://mirror.cachyos.org/repo/$arch_v4/$repo
+Server = https://cdn77.cachyos.org/repo/x86_64_v4/$repo
+Server = https://us.cachyos.org/repo/x86_64_v4/$repo
+Server = https://at.cachyos.org/repo/x86_64_v4/$repo
+Server = https://mirror.cachyos.org/repo/x86_64_v4/$repo
 EOF
 
   local loader="/lib/ld-linux-x86-64.so.2"
@@ -701,8 +703,10 @@ EOF
     }
 
     {
-      if ($0 == "Architecture = x86_64") {
-        $0 = "Architecture = auto"
+      # Stock pacman does not infer v3/v4 from "auto"; list every tier arch
+      # explicitly so tier-tagged packages are accepted.
+      if ($0 ~ /^Architecture[[:space:]]*=/) {
+        $0 = "Architecture = x86_64 x86_64_v3 x86_64_v4 x86_64-znver4"
       }
 
       if ($0 == "# CachyOS optimized repositories") {
@@ -1074,7 +1078,7 @@ for home in /home/*; do
   user=$(basename "$home")
   # Skip system users
   id "$user" >/dev/null 2>&1 || continue
-  
+
   find "$home/.cache" -mindepth 1 -maxdepth 1 \( \
     -name 'betterlockscreen' -o \
     -name 'mpd' -o \
@@ -1147,16 +1151,26 @@ EOF
     info "dnsmasq whitelist disabled — forwarding all queries to dnscrypt-proxy"
   fi
 
-  # dnscrypt-proxy: copy custom config or create placeholder
+  # dnscrypt-proxy: copy custom config or retune the shipped one.
+  # Port contract: dnsmasq above forwards to 127.0.0.1#5354. The package
+  # default toml listens on 127.0.0.1:53, which collides with dnsmasq and
+  # leaves the forward target dead → no DNS at boot. Fix the port here.
   mkdir -p "$MOUNT/etc/dnscrypt-proxy"
+  local dcp="$MOUNT/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
   if [[ -f "$SCRIPT_DIR/extra/network/dnscrypt-proxy.toml" ]]; then
-    cp "$SCRIPT_DIR/extra/network/dnscrypt-proxy.toml" "$MOUNT/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
-  elif [[ ! -f "$MOUNT/etc/dnscrypt-proxy/dnscrypt-proxy.toml" ]]; then
-    cat > "$MOUNT/etc/dnscrypt-proxy/dnscrypt-proxy.toml" <<'EOF'
-# drop your dnscrypt-proxy config here.
-# example:
-# listen_addresses = ['127.0.0.2:5353']
+    cp "$SCRIPT_DIR/extra/network/dnscrypt-proxy.toml" "$dcp"
+    if ! grep -q '127.0.0.1:5354' "$dcp"; then
+      warn "custom dnscrypt-proxy.toml does not listen on 127.0.0.1:5354 — dnsmasq forward will fail"
+    fi
+  elif [[ -f "$dcp" ]]; then
+    sed -i "s|^listen_addresses = .*|listen_addresses = ['127.0.0.1:5354']|" "$dcp"
+  else
+    cat > "$dcp" <<'EOF'
+# fallback placeholder: dnscrypt-proxy package config was missing.
+# dnsmasq forwards to this port; add real server config or DNS stays dead.
+listen_addresses = ['127.0.0.1:5354']
 EOF
+    warn "dnscrypt-proxy package config missing — placeholder written, DNS will not resolve until configured"
   fi
 }
 
@@ -1186,14 +1200,17 @@ install_ssh() {
     return 0
   fi
   info "installing openssh"
-  install_pkgs openssh || warn "openssh install failed"
+  # Artix splits runit service dirs into -runit packages; without
+  # openssh-runit there is no /etc/sv/sshd to enable.
+  install_pkgs openssh openssh-runit || warn "openssh install failed"
   enable_service sshd || true
 }
 
 # Configure ufw firewall: deny incoming, allow outgoing, allow SSH if enabled
 configure_firewall() {
   info "configuring ufw firewall"
-  install_pkgs ufw || { warn "ufw install failed"; return 1; }
+  # ufw-runit provides the /etc/sv/ufw service dir (see openssh-runit note)
+  install_pkgs ufw ufw-runit || { warn "ufw install failed"; return 1; }
 
   chroot_raw ufw --force enable || warn "ufw enable failed"
   chroot_raw ufw default deny incoming || true
@@ -1292,7 +1309,7 @@ cleanup_aur_builds() {
     info "non-interactive terminal: keeping ~/src"
     return 0
   fi
-  
+
   if [[ "$input" =~ ^[Nn]$ ]]; then
     info "keeping ~/src"
     return 0
@@ -1559,7 +1576,7 @@ EOF
   # Bash profile autostart X on tty1 (fallback)
   if [[ ! -f "$MOUNT/home/$USERNAME/.bash_profile" ]]; then
     cat > "$MOUNT/home/$USERNAME/.bash_profile" <<'EOF'
-if [ -z "$DISPLAY" ] && [ "$(tty)" = /dev/tty1 ]; then
+if [ -z "$DISPLAY" ] && [ "$(tty)" = "/dev/tty1" ]; then
   exec startx ~/.xinitrc -- vt1
 fi
 EOF
@@ -1569,14 +1586,18 @@ EOF
   chroot_raw chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
 }
 
-# Set default Xft.dpi (96)
+# Set default Xft.dpi (96) — only if dotfiles did not ship one
 configure_xresources() {
   info "setting default dpi (96) — override in ~/.Xresources if needed"
 
-  cat > "$MOUNT/home/$USERNAME/.Xresources" <<EOF
+  if [[ ! -f "$MOUNT/home/$USERNAME/.Xresources" ]]; then
+    cat > "$MOUNT/home/$USERNAME/.Xresources" <<EOF
 Xft.dpi: 96
 EOF
-  info "dpi: 96"
+    info "dpi: 96"
+  else
+    info ".Xresources shipped with dotfiles, keeping it"
+  fi
 }
 
 # Add temporary NOPASSWD sudo for wheel group (needed for aura/jaiba builds as user)
@@ -1591,7 +1612,7 @@ remove_aura_sudoers() {
   rm -f "$MOUNT/etc/sudoers.d/99-aura-temp"
 }
 
-# Build aura (AUR helper) from source using rustup/cargo
+# Build aura (AUR helper) from source using rustup/cargo (aura 4 is Rust)
 build_aura() {
   info "building aura with rustup"
 
@@ -1797,7 +1818,11 @@ report_failures() {
 cleanup_umount() {
   info "unmounting"
   sync
-  swapoff "$MOUNT/swap/swapfile" || true
+  # Only swapoff if the swapfile is actually active; swapoff on an inactive
+  # file prints "Invalid argument" and pollutes failure triage.
+  if grep -qs "$MOUNT/swap/swapfile" /proc/swaps; then
+    swapoff "$MOUNT/swap/swapfile" || true
+  fi
   umount -R "$MOUNT" || umount -l "$MOUNT" || true
   cryptsetup close cryptroot || true
   CLEANED_UP=1
