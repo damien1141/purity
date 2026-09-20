@@ -1613,51 +1613,49 @@ remove_aura_sudoers() {
   rm -f "$MOUNT/etc/sudoers.d/99-aura-temp"
 }
 
-# Build aura (AUR helper) from source using rustup/cargo (aura 4 is Rust)
+# Build aura (AUR helper) from the AUR using makepkg + pacman -U
 build_aura() {
-  info "building aura with rustup"
+  info "building aura from AUR"
 
-  # Verify rustup is available
-  if ! grep -Fxq rustup "$WORKDIR/pkglist" 2>/dev/null; then
-    warn "rustup not found, skipping aura"
-    FAILED+=("aura: rustup missing")
+  # Verify base-devel (makepkg, etc.) is available
+  if ! grep -Fxq base-devel "$WORKDIR/pkglist" 2>/dev/null && ! grep -Fxq makepkg "$WORKDIR/pkglist" 2>/dev/null; then
+    warn "makepkg not found, skipping aura"
+    FAILED+=("aura: makepkg missing")
     return 1
   fi
 
-  # Enable passwordless sudo for build user
+  # Enable passwordless sudo for build user (makepkg -s installs makedepends)
   add_aura_sudoers
 
-  # Initialize rustup stable toolchain
-  chroot_exec "sudo -u $USERNAME bash -lc 'rustup default stable'" || {
-    remove_aura_sudoers
-    FAILED+=("aura: rustup bootstrap failed")
-    return 1
-  }
-
-  # Clone aura repository
-  chroot_exec "sudo -u $USERNAME bash -lc 'mkdir -p ~/src && [ -d ~/src/aura ] || git clone https://github.com/aurapm/aura.git ~/src/aura'" || {
+  # Clone aura from the AUR
+  chroot_exec "sudo -u $USERNAME bash -lc 'mkdir -p ~/src && [ -d ~/src/aura ] || git clone https://aur.archlinux.org/aura.git ~/src/aura'" || {
     remove_aura_sudoers
     FAILED+=("aura: git clone failed")
     return 1
   }
 
-  # Build aura in release mode
-  chroot_exec "sudo -u $USERNAME bash -lc 'cd ~/src/aura && PATH=\"\$HOME/.cargo/bin:\$PATH\" cargo build --release'" || {
+  # Build with makepkg -s (installs build deps, builds PKGBIN)
+  chroot_exec "sudo -u $USERNAME bash -lc 'cd ~/src/aura && makepkg -s --noconfirm'" || {
     remove_aura_sudoers
-    FAILED+=("aura: cargo build failed")
+    FAILED+=("aura: makepkg failed")
     return 1
   }
 
-  # Verify binary exists and install to /usr/local/bin
-  local aura_bin="/home/$USERNAME/src/aura/target/release/aura"
-  if [[ ! -f "$MOUNT$aura_bin" ]]; then
+  # Install the built package with pacman -U (needs root)
+  chroot_exec "sudo -u $USERNAME bash -lc 'cd ~/src/aura && sudo pacman -U --noconfirm *.pkg.tar.zst'" || {
     remove_aura_sudoers
-    FAILED+=("aura: binary missing after build")
+    FAILED+=("aura: pacman -U failed")
     return 1
-  fi
+  }
 
-  install -Dm755 "$MOUNT$aura_bin" "$MOUNT/usr/local/bin/aura"
-  chroot_raw aura --version || true
+  # Verify installation
+  chroot_raw aura --version || {
+    remove_aura_sudoers
+    FAILED+=("aura: version check failed")
+    return 1
+  }
+
+  remove_aura_sudoers
 }
 
 # Build jaiba (local Rust TUI KeePass manager) from source
