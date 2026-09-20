@@ -1323,9 +1323,10 @@ system_update() {
   info "updating system via aura"
   if ! chroot_raw aura --version >/dev/null 2>&1; then
     warn "aura unavailable, skipping system update"
-    return 1
+    return 0   # was: return 1 — under set -e that aborted the install at 99%
   fi
   chroot_exec "sudo -u $USERNAME bash -lc 'aura -Syyu --noconfirm'" || warn "aura -Syyu failed"
+  return 0
 }
 
 # Enable a runit service by symlinking to runsvdir/default
@@ -1818,13 +1819,28 @@ report_failures() {
 cleanup_umount() {
   info "unmounting"
   sync
-  # Only swapoff if the swapfile is actually active; swapoff on an inactive
-  # file prints "Invalid argument" and pollutes failure triage.
   if grep -qs "$MOUNT/swap/swapfile" /proc/swaps; then
     swapoff "$MOUNT/swap/swapfile" || true
   fi
-  umount -R "$MOUNT" || umount -l "$MOUNT" || true
-  cryptsetup close cryptroot || true
+
+  # Reverse-order unmount from /proc/mounts so children go before parents.
+  # Per-mount lazy fallback: one busy bind (e.g. /mnt/run) must not abort the
+  # whole cascade and strand the LUKS device open.
+  local m tries
+  for m in $(awk -v mnt="$MOUNT" '$2 == mnt || index($2, mnt "/") == 1 {print $2}' /proc/mounts | sort -r); do
+    for tries in 1 2; do
+      umount "$m" 2>/dev/null && break
+      [[ "$tries" -eq 2 ]] && umount -l "$m" 2>/dev/null
+    done
+  done
+  umount "$MOUNT" 2>/dev/null || umount -l "$MOUNT" 2>/dev/null || true
+
+  tries=0
+  until cryptsetup close cryptroot 2>/dev/null || [[ "$tries" -ge 3 ]]; do
+    tries=$((tries + 1))
+    sleep 1
+  done
+  cryptsetup close cryptroot 2>/dev/null || warn "cryptroot still open — reboot live to clear"
   CLEANED_UP=1
 }
 
