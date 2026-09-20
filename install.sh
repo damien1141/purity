@@ -1488,8 +1488,12 @@ EOF
       fi
 
       if command -v efibootmgr >/dev/null 2>&1; then
-        local esp_part_num
-        esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1)"
+        local esp_part_num=""
+        esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1 || true)"
+        if [[ -z "$esp_part_num" ]]; then
+          # fallback: trailing digits of the partition node (vda1→1, nvme0n1p1→1)
+          esp_part_num="$(basename "$BOOT_PART" | grep -o '[0-9]\+$' || true)"
+        fi
         if [[ -n "$esp_part_num" ]]; then
           efibootmgr --create --disk "$DISK" --part "$esp_part_num" \
             --label "Artix Limine" --loader '\EFI\limine\limine.efi' \
