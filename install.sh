@@ -1277,6 +1277,8 @@ if [ -d /sys/firmware/efi ]; then
     mkdir -p "$ESP/EFI/limine" "$ESP/EFI/BOOT"
     cp "$EFI_BIN" "$ESP/EFI/limine/limine.efi"
     cp "$EFI_BIN" "$ESP/EFI/BOOT/BOOTX64.EFI"
+    # ship config to both locations for limine version compatibility
+    [ -f "$ESP/limine/limine.conf" ] && cp "$ESP/limine/limine.conf" "$ESP/limine.conf"
     [ -f "$ESP/limine/limine.conf" ] && cp "$ESP/limine/limine.conf" "$ESP/EFI/limine/limine.conf"
     echo "Limine EFI reinstalled"
   fi
@@ -1458,21 +1460,23 @@ EOF
     efi_src="$(find "$MOUNT/usr/share/limine" -maxdepth 1 -type f -name '*.efi' 2>/dev/null | head -n1 || true)"
 
     if [[ -n "$efi_src" ]]; then
-      mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
-      cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
-      cp "$efi_src" "$MOUNT/boot/EFI/BOOT/BOOTX64.EFI"
-      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
+    mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
+    cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
+    cp "$efi_src" "$MOUNT/boot/EFI/BOOT/BOOTX64.EFI"
+    # limine 7+ looks for config at ESP root; older versions in /EFI/limine/.
+    # ship both so it works regardless of version.
+    cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
+    cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
 
-      if command -v efibootmgr >/dev/null 2>&1; then
-        # Dynamically get partition number (e.g., '1' from /dev/nvme0n1p1 or /dev/sda1)
+    if command -v efibootmgr >/dev/null 2>&1; then
         local esp_part_num
         esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1)"
         if [[ -n "$esp_part_num" ]]; then
-          efibootmgr --create --disk "$DISK" --part "$esp_part_num" --label "Artix Limine" --loader '\EFI\limine\limine.efi' || true
+        efibootmgr --create --disk "$DISK" --part "$esp_part_num" --label "Artix Limine" --loader '\EFI\limine\limine.efi' || true
         else
-          warn "could not determine ESP partition number, skipping efibootmgr"
+        warn "could not determine ESP partition number, skipping efibootmgr"
         fi
-      fi
+    fi
     else
       warn "limine efi binary not found"
       FAILED+=("limine-efi-binary")
@@ -1741,7 +1745,7 @@ build_jaiba() {
 aur_try() {
   local pkg
   for pkg in "$@"; do
-    if chroot_exec "sudo -u $USERNAME bash -lc 'aura -A --needed --noconfirm $pkg'"; then
+    if chroot_exec "sudo -u $USERNAME bash -lc 'aura -A --noconfirm $pkg'"; then
       return 0
     fi
   done
