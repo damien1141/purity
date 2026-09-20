@@ -433,8 +433,7 @@ setup_filesystems() {
   mount "$BOOT_PART" "$MOUNT/boot"
 }
 
-# Create swapfile in @swap subvolume (if swap size > 0)
-setup_swapfile()
+setup_swapfile() {
   if [[ "$SWAP_SIZE_GIB" -eq 0 ]]; then
     info "swapfile disabled by user"
     return 0
@@ -470,6 +469,7 @@ setup_swapfile()
   else
     warn "mkswap failed"
   fi
+}
 
 # Install base system using basestrap (Artix) or pacstrap (Arch)
 strap_base() {
