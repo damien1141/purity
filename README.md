@@ -11,9 +11,13 @@ Right sided vertical bar, running xorg that feels like wayland bc I made a custo
 [insert sick ass workflow video here later im probably not gonna do this, at the very least ill put some screenshots, also probably not gonna do that]
 
 ## Quick Start
-
+*DO NOT UPDATE SYSTEM BEFORE RUNNING, the script handles everything*
 ```bash
-sudo ./install.sh
+pacman -Sy git
+git clone https://github.com/damien1141/purity
+cd purity
+chmod +x install.sh
+./install.sh
 ```
 
 The script is fully interactive. Prompts for:

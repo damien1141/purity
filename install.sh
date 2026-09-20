@@ -1613,6 +1613,27 @@ remove_aura_sudoers() {
   rm -f "$MOUNT/etc/sudoers.d/99-aura-temp"
 }
 
+# Install rustup and set default stable toolchain (needed for jaiba and other Rust builds)
+setup_rustup() {
+  info "setting up rustup"
+
+  # Install rustup if not present
+  if ! chroot_raw rustup --version >/dev/null 2>&1; then
+    chroot_exec "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" || {
+      warn "rustup install failed"
+      FAILED+=("rustup: install failed")
+      return 1
+    }
+  fi
+
+  # Set default stable toolchain for build user
+  chroot_exec "sudo -u $USERNAME bash -lc 'rustup default stable'" || {
+    warn "rustup default stable failed"
+    FAILED+=("rustup: default stable failed")
+    return 1
+  }
+}
+
 # Build aura (AUR helper) from the AUR using makepkg + pacman -U
 build_aura() {
   info "building aura from AUR"
@@ -1678,13 +1699,6 @@ build_jaiba() {
 
   # Enable passwordless sudo for build user
   add_aura_sudoers
-
-  # Initialize rustup stable toolchain
-  chroot_exec "sudo -u $USERNAME bash -lc 'rustup default stable'" || {
-    remove_aura_sudoers
-    FAILED+=("jaiba: rustup bootstrap failed")
-    return 1
-  }
 
   # Copy source to user's src directory
   local src="$MOUNT/home/$USERNAME/src/jaiba"
@@ -1897,6 +1911,7 @@ main() {
   copy_dotfiles
   configure_xresources
 
+  setup_rustup || true
   build_aura || true
   build_jaiba || true
   install_aur_packages || true
