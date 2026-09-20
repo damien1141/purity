@@ -58,6 +58,7 @@ LUKS_UUID=""            # UUID of the LUKS partition (for kernel cmdline)
 INSTALL_SSH=1           # Whether to install openssh (1=yes, 0=no)
 FAILED=()               # Array of failure messages for final report
 CLEANED_UP=0            # Flag: cleanup already performed (prevents double-unmount)
+AUR_JOBS=2              # aggregate build pressure cap; swap handles per-process peaks
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -462,10 +463,13 @@ setup_swapfile() {
   chmod 600 "$f"
   if mkswap "$f"; then
     SWAP_CREATED=1
+    # activate NOW: rustc linking wasmtime (gram-git dep) peaks past free RAM
+    # and gets OOM-killed without headroom. cleanup_umount already swapoffs
+    # this exact path, so no leak.
+    swapon "$f" || warn "swapon failed — rust builds may OOM"
   else
     warn "mkswap failed"
   fi
-}
 
 # Install base system using basestrap (Artix) or pacstrap (Arch)
 strap_base() {
@@ -1377,7 +1381,6 @@ enable_services() {
 configure_bootloader() {
   info "configuring limine"
 
-  # Find kernel: prefer CachyOS kernel, fallback to any vmlinuz
   local kernel_path initrd_path kernel_file initrd_file ucode_file=""
   kernel_path="$(ls "$MOUNT"/boot/vmlinuz-*cachyos* 2>/dev/null | head -n1 || true)"
   if [[ -z "$kernel_path" ]]; then
@@ -1386,12 +1389,10 @@ configure_bootloader() {
   [[ -n "$kernel_path" ]] || die "no kernel found in /boot"
   kernel_file="$(basename "$kernel_path")"
 
-  # Find initramfs: prefer CachyOS non-fallback, fallback to any non-fallback
   initrd_path="$(ls "$MOUNT"/boot/initramfs-*cachyos*.img 2>/dev/null | grep -v fallback | head -n1 || true)"
   if [[ -z "$initrd_path" ]]; then
     initrd_path="$(ls "$MOUNT"/boot/initramfs-*.img 2>/dev/null | grep -v fallback | head -n1 || true)"
   fi
-  # If still not found, regenerate initramfs and try again
   if [[ -z "$initrd_path" ]]; then
     chroot_raw mkinitcpio -P || true
     initrd_path="$(ls "$MOUNT"/boot/initramfs-*.img 2>/dev/null | grep -v fallback | head -n1 || true)"
@@ -1399,51 +1400,38 @@ configure_bootloader() {
   [[ -n "$initrd_path" ]] || die "no initramfs found"
   initrd_file="$(basename "$initrd_path")"
 
-  # Microcode initrd (intel-ucode.img or amd-ucode.img)
   if [[ -f "$MOUNT/boot/$MICROCODE.img" ]]; then
     ucode_file="$MICROCODE.img"
   fi
 
-  # Kernel command line: LUKS decryption via UUID, root on /dev/mapper/cryptroot with @ subvol
   local cmdline="cryptdevice=UUID=$LUKS_UUID:cryptroot root=/dev/mapper/cryptroot rootflags=subvol=@ rw"
-  # NVIDIA: enable DRM KMS modeset
   if [[ "$GPU" == "nvidia" ]]; then
     cmdline+=" nvidia_drm.modeset=1"
   fi
 
   mkdir -p "$MOUNT/boot/limine"
 
-  # Background image: prefer black.bmp, then black.png, else create README
   local wall_src="" wall_dest_name="" wall_line=""
   if [[ -f "$ASSETS_DIR/black.bmp" ]]; then
-    wall_src="$ASSETS_DIR/black.bmp"
-    wall_dest_name="black.bmp"
+    wall_src="$ASSETS_DIR/black.bmp"; wall_dest_name="black.bmp"
   elif [[ -f "$ASSETS_DIR/black.png" ]]; then
-    wall_src="$ASSETS_DIR/black.png"
-    wall_dest_name="black.png"
-  else
-    cat > "$ASSETS_DIR/README.txt" <<'EOF'
-put pure black background here.
-preferred: black.bmp
-accepted: black.png
-EOF
+    wall_src="$ASSETS_DIR/black.png"; wall_dest_name="black.png"
   fi
-
   if [[ -n "$wall_src" ]]; then
     cp "$wall_src" "$MOUNT/boot/limine/$wall_dest_name"
     wall_line="wallpaper: boot():/limine/$wall_dest_name"
   fi
 
-  # Microcode module line for limine config
   local ucode_line=""
   if [[ -n "$ucode_file" ]]; then
     ucode_line="    module_path: boot():/$ucode_file"
   fi
 
-  # Generate limine.conf
+  # timeout 5 + default 0 while debugging: menu visible, valid index.
+  # flip timeout to 0 once you've seen it boot once.
   cat > "$MOUNT/boot/limine/limine.conf" <<EOF
-timeout: 0
-default: 1
+timeout: 5
+default: 0
 $wall_line
 
 :CachyOS Artix
@@ -1455,34 +1443,55 @@ $ucode_line
 EOF
 
   if [[ "$UEFI" -eq 1 ]]; then
-    # UEFI: find limine EFI binary, install to ESP, register with efibootmgr
-    local efi_src
-    efi_src="$(find "$MOUNT/usr/share/limine" -maxdepth 1 -type f -name '*.efi' 2>/dev/null | head -n1 || true)"
+    # explicit arch-named binary; never find|head over *.efi
+    local efi_name
+    case "$(uname -m)" in
+      aarch64) efi_name="BOOTAA64.EFI" ;;
+      riscv64) efi_name="BOOTRISCV64.EFI" ;;
+      *)       efi_name="BOOTX64.EFI" ;;
+    esac
+    local efi_src="$MOUNT/usr/share/limine/$efi_name"
 
-    if [[ -n "$efi_src" ]]; then
-    mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
-    cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
-    cp "$efi_src" "$MOUNT/boot/EFI/BOOT/BOOTX64.EFI"
-    # limine 7+ looks for config at ESP root; older versions in /EFI/limine/.
-    # ship both so it works regardless of version.
-    cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
-    cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
+    if [[ -f "$efi_src" ]]; then
+      mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
+      cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
+      cp "$efi_src" "$MOUNT/boot/EFI/BOOT/$efi_name"
+      # every path limine searches, old + new lookup rules
+      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
+      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
 
-    if command -v efibootmgr >/dev/null 2>&1; then
+      # verify on-disk BEFORE unmount; silent absence was the old failure mode
+      local missing=0 f
+      for f in "$MOUNT/boot/EFI/BOOT/$efi_name" \
+               "$MOUNT/boot/EFI/limine/limine.efi" \
+               "$MOUNT/boot/limine.conf" \
+               "$MOUNT/boot/EFI/limine/limine.conf"; do
+        if [[ ! -f "$f" ]]; then
+          warn "missing on ESP: $f"
+          missing=1
+        fi
+      done
+      if (( missing )); then
+        ls -laR "$MOUNT/boot" >&2 || true
+        FAILED+=("limine-esp-incomplete")
+      fi
+
+      if command -v efibootmgr >/dev/null 2>&1; then
         local esp_part_num
         esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1)"
         if [[ -n "$esp_part_num" ]]; then
-        efibootmgr --create --disk "$DISK" --part "$esp_part_num" --label "Artix Limine" --loader '\EFI\limine\limine.efi' || true
+          efibootmgr --create --disk "$DISK" --part "$esp_part_num" \
+            --label "Artix Limine" --loader '\EFI\limine\limine.efi' \
+            || warn "efibootmgr entry failed — ESP fallback ($efi_name) still covers boot"
         else
-        warn "could not determine ESP partition number, skipping efibootmgr"
+          warn "could not determine ESP partition number, skipping efibootmgr"
         fi
-    fi
+      fi
     else
-      warn "limine efi binary not found"
+      warn "limine efi binary ($efi_name) not found in target — limine package missing?"
       FAILED+=("limine-efi-binary")
     fi
   else
-    # BIOS: install limine to disk MBR
     chroot_raw limine bios-install "$DISK" || warn "limine bios install failed"
   fi
 }
@@ -1741,61 +1750,75 @@ build_jaiba() {
   chroot_raw jaiba --version || true
 }
 
-# Try installing AUR packages with aura, trying multiple variants
 aur_try() {
   local pkg
   for pkg in "$@"; do
-    if chroot_exec "sudo -u $USERNAME bash -lc 'aura -A --noconfirm $pkg'"; then
+    if chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --noconfirm $pkg'"; then
       return 0
     fi
   done
   return 1
 }
 
-# Install AUR packages using aura (built from source)
 install_aur_packages() {
-  info "installing aur packages"
+  info "installing aur packages (batched)"
 
-  # Verify aura is available
   if ! chroot_raw aura --version >/dev/null 2>&1; then
     warn "aura unavailable, skipping aur packages"
     FAILED+=("aur: aura unavailable")
     return 0
   fi
 
-  # If awesome not in official repos, try AUR
   if ! chroot_raw pacman -Q awesome >/dev/null 2>&1; then
     aur_try awesome || FAILED+=("aur: awesome")
   fi
 
-  # Try multiple package variants for each (bin, git, etc.)
-  aur_try gram-bin gram-git gram-editor-bin gram-editor-git gram-editor gram || FAILED+=("aur: gram")
-  aur_try obsidian obsidian-bin obsidian-appimage || FAILED+=("aur: obsidian")
-  aur_try betterbird-bin betterbird betterbird-beta-bin || FAILED+=("aur: betterbird")
-  aur_try librewolf-bin librewolf librewolf-appimage || FAILED+=("aur: librewolf")
-  aur_try opentubex-git opentubex-bin opentubex || FAILED+=("aur: opentubex")
-  aur_try greenclip || FAILED+=("aur: greenclip")
-  aur_try bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme")
-  aur_try qogir-icon-theme || FAILED+=("aur: qogir-icon-theme")
-  aur_try betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen")
-  aur_try mpdris2 || FAILED+=("aur: mpdris2")
-  aur_try ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans")
-  aur_try ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd")
-  aur_try ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman")
-  aur_try ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt")
-  aur_try onlyoffice || FAILED+=("aur: onlyoffice")
+  # first-choice variant per app; ONE aura transaction for all of them
+  local want=(
+    gram-bin obsidian-bin betterbird-bin librewolf-bin opentubex-git greenclip
+    bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2
+    ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-times-new-roman
+    ttf-arial-rounded-mt onlyoffice anki-bin bun-bin
+  )
 
-  # anki: try official repo first, then AUR bin
-  if grep -Fxq anki "$WORKDIR/pkglist" 2>/dev/null; then
-    install_pkgs anki || aur_try anki-bin || FAILED+=("anki")
-  else
-    aur_try anki-bin || FAILED+=("aur: anki")
+  local todo=() p
+  for p in "${want[@]}"; do
+    chroot_raw pacman -Q "$p" >/dev/null 2>&1 || todo+=("$p")
+  done
+
+  if ((${#todo[@]})); then
+    info "aura batch (${#todo[@]} pkgs): ${todo[*]}"
+    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --noconfirm ${todo[*]}'" \
+      || warn "aura batch reported failures — resolving misses below"
   fi
 
-  # bun: try AUR if not in official repos
-  if ! chroot_raw pacman -Q bun >/dev/null 2>&1; then
-    aur_try bun-bin bun || FAILED+=("aur: bun")
-  fi
+  # only what didn't land gets its variant chain, one pkg at a time
+  for p in "${want[@]}"; do
+    chroot_raw pacman -Q "$p" >/dev/null 2>&1 && continue
+    case "$p" in
+      gram-bin)          aur_try gram-bin gram-git gram-editor-bin gram-editor-git gram-editor gram || FAILED+=("aur: gram") ;;
+      obsidian-bin)      aur_try obsidian-bin obsidian obsidian-appimage || FAILED+=("aur: obsidian") ;;
+      betterbird-bin)    aur_try betterbird-bin betterbird betterbird-beta-bin || FAILED+=("aur: betterbird") ;;
+      librewolf-bin)     aur_try librewolf-bin librewolf librewolf-appimage || FAILED+=("aur: librewolf") ;;
+      opentubex-git)     aur_try opentubex-git opentubex-bin opentubex || FAILED+=("aur: opentubex") ;;
+      greenclip)         aur_try greenclip || FAILED+=("aur: greenclip") ;;
+      bibata-cursor-theme-bin) aur_try bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme") ;;
+      qogir-icon-theme)  aur_try qogir-icon-theme || FAILED+=("aur: qogir-icon-theme") ;;
+      betterlockscreen)  aur_try betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen") ;;
+      mpdris2)           aur_try mpdris2 || FAILED+=("aur: mpdris2") ;;
+      ttf-harmonyos-sans) aur_try ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
+      ttf-jetbrains-mono-nerd) aur_try ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
+      ttf-times-new-roman) aur_try ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman") ;;
+      ttf-arial-rounded-mt) aur_try ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt") ;;
+      onlyoffice)        aur_try onlyoffice || FAILED+=("aur: onlyoffice") ;;
+      anki-bin)          if grep -Fxq anki "$WORKDIR/pkglist" 2>/dev/null; then
+                           install_pkgs anki || aur_try anki-bin || FAILED+=("anki")
+                         else
+                           aur_try anki-bin || FAILED+=("aur: anki")
+                         fi ;;
+      bun-bin)           aur_try bun-bin bun || FAILED+=("aur: bun") ;;
+    esac
+  done
 }
 
 # Final DNS configuration: lock resolv.conf to localhost (dnsmasq/dnscrypt-proxy)
