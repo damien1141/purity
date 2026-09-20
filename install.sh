@@ -1442,6 +1442,19 @@ $ucode_line
     module_path: boot():/$initrd_file
 EOF
 
+  # self-check: a config with no entry line or missing kernel/initrd on the
+  # ESP boots to exactly the "no valid entries" screen. fail loud here instead.
+  if ! grep -q '^:' "$MOUNT/boot/limine/limine.conf" \
+     || ! grep -q 'kernel_path:' "$MOUNT/boot/limine/limine.conf"; then
+    die "limine.conf has no boot entry — heredoc mangled?"
+  fi
+  [[ -f "$MOUNT/boot/$kernel_file" ]]  || die "kernel $kernel_file not on ESP"
+  [[ -f "$MOUNT/boot/$initrd_file" ]]  || die "initramfs $initrd_file not on ESP"
+  local cf
+  for cf in "$MOUNT/boot/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"; do
+    grep -q '^:' "$cf" || die "copied config missing entry: $cf"
+  done
+
   if [[ "$UEFI" -eq 1 ]]; then
     # explicit arch-named binary; never find|head over *.efi
     local efi_name
