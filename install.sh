@@ -1427,8 +1427,6 @@ configure_bootloader() {
     ucode_line="    module_path: boot():/$ucode_file"
   fi
 
-  # timeout 5 + default 0 while debugging: menu visible, valid index.
-  # flip timeout to 0 once you've seen it boot once.
   cat > "$MOUNT/boot/limine/limine.conf" <<EOF
 timeout: 5
 default: 0
@@ -1442,18 +1440,72 @@ $ucode_line
     module_path: boot():/$initrd_file
 EOF
 
-  # self-check: a config with no entry line or missing kernel/initrd on the
-  # ESP boots to exactly the "no valid entries" screen. fail loud here instead.
+  # source-conf checks ONLY here; copies are verified after they exist
   if ! grep -q '^:' "$MOUNT/boot/limine/limine.conf" \
      || ! grep -q 'kernel_path:' "$MOUNT/boot/limine/limine.conf"; then
     die "limine.conf has no boot entry — heredoc mangled?"
   fi
   [[ -f "$MOUNT/boot/$kernel_file" ]]  || die "kernel $kernel_file not on ESP"
   [[ -f "$MOUNT/boot/$initrd_file" ]]  || die "initramfs $initrd_file not on ESP"
-  local cf
-  for cf in "$MOUNT/boot/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"; do
-    grep -q '^:' "$cf" || die "copied config missing entry: $cf"
-  done
+
+  if [[ "$UEFI" -eq 1 ]]; then
+    local efi_name
+    case "$(uname -m)" in
+      aarch64) efi_name="BOOTAA64.EFI" ;;
+      riscv64) efi_name="BOOTRISCV64.EFI" ;;
+      *)       efi_name="BOOTX64.EFI" ;;
+    esac
+    local efi_src="$MOUNT/usr/share/limine/$efi_name"
+
+    if [[ -f "$efi_src" ]]; then
+      mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
+      cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
+      cp "$efi_src" "$MOUNT/boot/EFI/BOOT/$efi_name"
+      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
+      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
+
+      # verify on-disk AFTER the copies; silent absence was the old failure mode
+      local missing=0 f
+      for f in "$MOUNT/boot/EFI/BOOT/$efi_name" \
+               "$MOUNT/boot/EFI/limine/limine.efi" \
+               "$MOUNT/boot/limine.conf" \
+               "$MOUNT/boot/EFI/limine/limine.conf"; do
+        if [[ ! -f "$f" ]]; then
+          warn "missing on ESP: $f"
+          missing=1
+        fi
+      done
+      # byte-identical cp can't mangle content, so this is a warn not a die
+      for f in "$MOUNT/boot/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"; do
+        if [[ -f "$f" ]] && ! grep -q '^:' "$f"; then
+          warn "copied config missing entry: $f"
+          missing=1
+        fi
+      done
+      if (( missing )); then
+        ls -laR "$MOUNT/boot" >&2 || true
+        FAILED+=("limine-esp-incomplete")
+      fi
+
+      if command -v efibootmgr >/dev/null 2>&1; then
+        local esp_part_num
+        esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1)"
+        if [[ -n "$esp_part_num" ]]; then
+          efibootmgr --create --disk "$DISK" --part "$esp_part_num" \
+            --label "Artix Limine" --loader '\EFI\limine\limine.efi' \
+            || warn "efibootmgr entry failed — ESP fallback ($efi_name) still covers boot"
+        else
+          warn "could not determine ESP partition number, skipping efibootmgr"
+        fi
+      fi
+    else
+      warn "limine efi binary ($efi_name) not found in target — limine package missing?"
+      FAILED+=("limine-efi-binary")
+    fi
+  else
+    chroot_raw limine bios-install "$DISK" || warn "limine bios install failed"
+  fi
+}
 
   if [[ "$UEFI" -eq 1 ]]; then
     # explicit arch-named binary; never find|head over *.efi
