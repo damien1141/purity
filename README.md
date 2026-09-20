@@ -16,8 +16,8 @@ Right sided vertical bar, running xorg that feels like wayland bc I made a custo
 pacman -Sy git
 git clone https://github.com/damien1141/purity
 cd purity
-chmod +x install.sh
-./install.sh
+chmod +x run.sh
+./run.sh
 ```
 
 The script is fully interactive. Prompts for:
