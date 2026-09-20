@@ -1507,59 +1507,6 @@ EOF
   fi
 }
 
-  if [[ "$UEFI" -eq 1 ]]; then
-    # explicit arch-named binary; never find|head over *.efi
-    local efi_name
-    case "$(uname -m)" in
-      aarch64) efi_name="BOOTAA64.EFI" ;;
-      riscv64) efi_name="BOOTRISCV64.EFI" ;;
-      *)       efi_name="BOOTX64.EFI" ;;
-    esac
-    local efi_src="$MOUNT/usr/share/limine/$efi_name"
-
-    if [[ -f "$efi_src" ]]; then
-      mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
-      cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
-      cp "$efi_src" "$MOUNT/boot/EFI/BOOT/$efi_name"
-      # every path limine searches, old + new lookup rules
-      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
-      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
-
-      # verify on-disk BEFORE unmount; silent absence was the old failure mode
-      local missing=0 f
-      for f in "$MOUNT/boot/EFI/BOOT/$efi_name" \
-               "$MOUNT/boot/EFI/limine/limine.efi" \
-               "$MOUNT/boot/limine.conf" \
-               "$MOUNT/boot/EFI/limine/limine.conf"; do
-        if [[ ! -f "$f" ]]; then
-          warn "missing on ESP: $f"
-          missing=1
-        fi
-      done
-      if (( missing )); then
-        ls -laR "$MOUNT/boot" >&2 || true
-        FAILED+=("limine-esp-incomplete")
-      fi
-
-      if command -v efibootmgr >/dev/null 2>&1; then
-        local esp_part_num
-        esp_part_num="$(lsblk -no PARTNUM "$BOOT_PART" 2>/dev/null | head -n1)"
-        if [[ -n "$esp_part_num" ]]; then
-          efibootmgr --create --disk "$DISK" --part "$esp_part_num" \
-            --label "Artix Limine" --loader '\EFI\limine\limine.efi' \
-            || warn "efibootmgr entry failed — ESP fallback ($efi_name) still covers boot"
-        else
-          warn "could not determine ESP partition number, skipping efibootmgr"
-        fi
-      fi
-    else
-      warn "limine efi binary ($efi_name) not found in target — limine package missing?"
-      FAILED+=("limine-efi-binary")
-    fi
-  else
-    chroot_raw limine bios-install "$DISK" || warn "limine bios install failed"
-  fi
-}
 
 # Create user account with wheel group, set passwords, configure sudo
 create_user() {
