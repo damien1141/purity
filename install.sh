@@ -711,7 +711,7 @@ EOF
       # Stock pacman does not infer v3/v4 from "auto"; list every tier arch
       # explicitly so tier-tagged packages are accepted.
       if ($0 ~ /^Architecture[[:space:]]*=/) {
-        $0 = "Architecture = x86_64 x86_64_v3 x86_64_v4 x86_64-znver4"
+        $0 = "Architecture = auto"
       }
 
       if ($0 == "# CachyOS optimized repositories") {
@@ -842,12 +842,11 @@ install_official_packages() {
   install_pkgs \
     artix-runit dbus-runit elogind-runit networkmanager-runit iwd-runit \
     bluez-runit bluetooth-runit cronie-runit dnsmasq-runit dnscrypt-proxy-runit \
-    acpid-runit openntpd-runit || true
+    acpid-runit chrony-runit || true
 
   info "installing network stack"
-  install_pkgs networkmanager iwd dnsmasq dnscrypt-proxy || true
+  install_pkgs networkmanager iwd dnsmasq dnscrypt-proxy chrony || true
   install_pkgs networkmanager-iwd || true
-  install_pkgs openntpd || true
 
   info "installing pipewire"
   install_pkgs \
@@ -1015,7 +1014,7 @@ configure_mkinitcpio() {
 MODULES=($modules)
 BINARIES=()
 FILES=()
-HOOKS=(base udev autodetect keyboard keymap modconf block encrypt filesystems fsck)
+HOOKS=(base udev autodetect keyboard keymap modconf block encrypt filesystems)
 EOF
 
   chroot_raw mkinitcpio -P || warn "mkinitcpio failed"
@@ -1043,7 +1042,7 @@ NUMBER_LIMIT_IMPORTANT="5"
 NUMBER_MIN_AGE="1800"
 TIMELINE_CREATE="yes"
 TIMELINE_CLEANUP="yes"
-TIMELINE_LIMIT_HOURLY="0"
+TIMELINE_LIMIT_HOURLY="24"
 TIMELINE_LIMIT_DAILY="7"
 TIMELINE_LIMIT_WEEKLY="0"
 TIMELINE_LIMIT_MONTHLY="0"
@@ -1188,15 +1187,16 @@ EOF
   fi
 }
 
-# Configure NTP (openntpd) and timezone
+# Configure NTP (chrony) and timezone
 configure_ntp() {
-  info "configuring ntp (openntpd)"
+  info "configuring ntp (chrony)"
 
-  # openntpd config: pool.ntp.org, slew-only time correction
-  cat > "$MOUNT/etc/ntpd.conf" <<'EOF'
-servers pool.ntp.org
-offset_correction_interval yes
-slew only
+  # chrony config: pool.ntp.org iburst, driftfile, makestep, rtcsync
+  cat > "$MOUNT/etc/chrony.conf" <<'EOF'
+pool pool.ntp.org iburst
+driftfile /var/lib/chrony/drift
+makestep 1.0 3
+rtcsync
 EOF
 
   # Set timezone symlink
@@ -1371,7 +1371,7 @@ verify_timesync() {
   if chroot_raw ntpctl -s 2>/dev/null; then
     info "time synchronized"
   else
-    warn "time sync status unknown — verify openntpd is running"
+    warn "time sync status unknown — verify chronyd is running"
   fi
 }
 
@@ -1444,7 +1444,7 @@ enable_services() {
   enable_service dnsmasq || true
   enable_service dnscrypt-proxy || true
   enable_service acpid || true
-  enable_service openntpd || true
+  enable_service chronyd || true
 }
 
 # Configure Limine bootloader (UEFI and BIOS)
@@ -2063,7 +2063,7 @@ nameserver ::1
 EOF
 
   # Make immutable to prevent NetworkManager/other tools from overwriting
-  chroot_raw chattr +i /etc/resolv.conf || warn "could not immutable resolv.conf"
+  # chattr +i /etc/resolv.conf || warn "could not immutable resolv.conf"
 }
 
 # Create post-install snapper snapshot for rollback reference
