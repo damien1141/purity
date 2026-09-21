@@ -6,7 +6,7 @@
 xset -b &
 
 # line that fixes things lol
-#dbus-update-activation-environment --systemd DBUS_SESSION_BUS_ADDRESS DISPLAY XAUTHORITY &
+dbus-update-activation-environment --systemd DBUS_SESSION_BUS_ADDRESS DISPLAY XAUTHORITY &
 
 # Launch polkit
 #exec lxsession &

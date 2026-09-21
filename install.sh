@@ -860,7 +860,7 @@ install_official_packages() {
     xorg-xkill xorg-xdpyinfo xterm xorg-fonts-misc ttf-dejavu || true
 
   info "installing wm + lua"
-  install_pkgs awesome lua lua53 luarocks || install_pkgs awesome lua luarocks || true
+  install_pkgs awesome lua lua54 luarocks || install_pkgs awesome lua luarocks || true
 
   info "installing desktop apps from official repos"
   install_pkgs \
@@ -1717,6 +1717,24 @@ EOF
   fi
 }
 
+# Enable autologin on tty1 via a custom runit agetty service.
+configure_autologin() {
+  info "configuring tty1 autologin for $USERNAME"
+
+  mkdir -p "$MOUNT/etc/sv/autologin-tty1"
+  cat > "$MOUNT/etc/sv/autologin-tty1/run" <<EOF
+#!/bin/sh
+exec agetty --autologin $USERNAME --noclear tty1 linux
+EOF
+  chmod +x "$MOUNT/etc/sv/autologin-tty1/run"
+
+  enable_service autologin-tty1
+
+  # Disable any default tty1 getty to avoid conflicts
+  rm -f "$MOUNT/etc/runit/runsvdir/default/agetty-tty1" 2>/dev/null || true
+  rm -f "$MOUNT/etc/runit/runsvdir/default/getty-tty1" 2>/dev/null || true
+}
+
 # Add temporary NOPASSWD sudo for wheel group (needed for aura/jaiba builds as user)
 add_aura_sudoers() {
   mkdir -p "$MOUNT/etc/sudoers.d"
@@ -1993,8 +2011,7 @@ install_aur_packages() {
   local want=(
     betterbird-bin opentubex-bin rofi-greenclip
     bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2
-    ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-times-new-roman
-    ttf-arial-rounded-mt onlyoffice-bin
+    ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-ms-fonts onlyoffice-bin
   )
 
   local todo=() p
@@ -2028,8 +2045,7 @@ install_aur_packages() {
       mpdris2)           aur_recover_pkg mpdris2 || FAILED+=("aur: mpdris2") ;;
       ttf-harmonyos-sans) aur_recover_pkg ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
       ttf-jetbrains-mono-nerd) aur_recover_pkg ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
-      ttf-times-new-roman) aur_recover_pkg ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman") ;;
-      ttf-arial-rounded-mt) aur_recover_pkg ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt") ;;
+      ttf-ms-fonts) aur_recover_pkg ttf-ms-fonts || FAILED+=("aur: ttf-ms-fonts") ;;
       onlyoffice-bin)    aur_recover_pkg onlyoffice-bin onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
     esac
   done
@@ -2152,6 +2168,7 @@ main() {
   create_limine_hook
 
   create_user
+  configure_autologin
   copy_dotfiles
   configure_xresources
 
