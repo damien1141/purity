@@ -596,53 +596,23 @@ init_pacman_keys() {
 
 # Add CachyOS optimized repositories without CachyOS system packages
 configure_repos() {
-  info "adding cachyos optimized repositories"
+  info "adding cachyos optimized repositories (generic x86_64)"
 
   local pacman_conf="$MOUNT/etc/pacman.conf"
   local mirrorlist_dir="$MOUNT/etc/pacman.d"
   [[ -f "$pacman_conf" ]] || die "pacman.conf not found in target"
   mkdir -p "$mirrorlist_dir"
 
-  # Literal arch-tier paths, NOT $arch_v3/$arch_v4 variables: those variables
-  # are only expanded by CachyOS's patched pacman. Artix ships stock pacman,
-  # which would leave them unexpanded and fail the sync. $repo is standard
-  # pacman and safe. znver4 sections reuse the x86_64_v4 path (per CachyOS
-  # wiki); $repo distinguishes them.
-  cat > "$mirrorlist_dir/cachyos-v3-mirrorlist" <<'EOF'
-Server = https://cdn77.cachyos.org/repo/x86_64_v3/$repo
-Server = https://us.cachyos.org/repo/x86_64_v3/$repo
-Server = https://at.cachyos.org/repo/x86_64_v3/$repo
-Server = https://mirror.cachyos.org/repo/x86_64_v3/$repo
+  # generic path: packages tagged arch=x86_64, stock-pacman safe.
+  # tier repos (x86_64_v3/v4/znver4) tag packages arch=x86_64_v3 which stock
+  # pacman rejects; those need cachyos-pacman. see todo.md decision log.
+  cat > "$mirrorlist_dir/cachyos-mirrorlist" <<'EOF'
+Server = https://cdn77.cachyos.org/repo/x86_64/$repo
+Server = https://us.cachyos.org/repo/x86_64/$repo
+Server = https://at.cachyos.org/repo/x86_64/$repo
+Server = https://mirror.cachyos.org/repo/x86_64/$repo
 EOF
 
-  cat > "$mirrorlist_dir/cachyos-v4-mirrorlist" <<'EOF'
-Server = https://cdn77.cachyos.org/repo/x86_64_v4/$repo
-Server = https://us.cachyos.org/repo/x86_64_v4/$repo
-Server = https://at.cachyos.org/repo/x86_64_v4/$repo
-Server = https://mirror.cachyos.org/repo/x86_64_v4/$repo
-EOF
-
-  local loader="/lib/ld-linux-x86-64.so.2"
-  if [[ ! -x "$loader" && -x "/usr/lib/ld-linux-x86-64.so.2" ]]; then
-    loader="/usr/lib/ld-linux-x86-64.so.2"
-  fi
-
-  local tier=""
-  if command -v gcc >/dev/null 2>&1 && gcc -march=native -Q --help=target 2>&1 | grep -E '^[[:space:]]*-march=' | grep -Eq '[[:space:]]znver[45]([[:space:]]|$)'; then
-    tier="znver4"
-  elif [[ -x "$loader" ]] && "$loader" --help 2>&1 | grep -Fq 'x86-64-v4 (supported, searched)'; then
-    tier="v4"
-  elif [[ -x "$loader" ]] && "$loader" --help 2>&1 | grep -Fq 'x86-64-v3 (supported, searched)'; then
-    tier="v3"
-  else
-    warn "cpu does not support a CachyOS optimized repository tier; using Artix packages"
-    return 0
-  fi
-
-  info "selected cachyos repository tier: $tier"
-
-  # The [cachyos] repository contains CachyOS system packages, including its
-  # pacman fork. Import the signing key directly and leave that repository out.
   local cachyos_key="F3B607488DB35A47"
   chroot_raw pacman-key --recv-keys "$cachyos_key" --keyserver keyserver.ubuntu.com || die "failed to import CachyOS signing key"
   chroot_raw pacman-key --lsign-key "$cachyos_key" || die "failed to sign CachyOS key locally"
@@ -653,127 +623,46 @@ EOF
   fi
 
   local tmp="$pacman_conf.cachyos.new"
-  awk -v tier="$tier" '
-    function is_section(line) {
-      return line ~ /^\[[^]]+\]$/
+  awk '
+    function is_section(line) { return line ~ /^\[[^]]+\]$/ }
+    function is_cachyos_repo(line) {
+      return line ~ /^\[(cachyos|cachyos-core|cachyos-extra|cachyos-v3|cachyos-core-v3|cachyos-extra-v3|cachyos-v4|cachyos-core-v4|cachyos-extra-v4|cachyos-znver4|cachyos-core-znver4|cachyos-extra-znver4)\]$/
     }
-
     function is_artix_repo(line) {
       return line ~ /^\[(system|world|galaxy|lib32|system-gremlins|world-gremlins|galaxy-gremlins|lib32-gremlins|system-goblins|world-goblins|galaxy-goblins|lib32-goblins)\]$/
     }
-
-    function is_cachyos_repo(line) {
-      return line ~ /^\[(cachyos|cachyos-v3|cachyos-core-v3|cachyos-extra-v3|cachyos-v4|cachyos-core-v4|cachyos-extra-v4|cachyos-znver4|cachyos-core-znver4|cachyos-extra-znver4)\]$/
-    }
-
     function emit_repos() {
       print ""
-      print "# CachyOS optimized repositories"
-      print "# [cachyos] is intentionally omitted; it contains CachyOS system packages."
-      if (tier == "znver4") {
-        print "[cachyos-znver4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-        print ""
-        print "[cachyos-core-znver4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-        print ""
-        print "[cachyos-extra-znver4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-      } else if (tier == "v4") {
-        print "[cachyos-v4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-        print ""
-        print "[cachyos-core-v4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-        print ""
-        print "[cachyos-extra-v4]"
-        print "Include = /etc/pacman.d/cachyos-v4-mirrorlist"
-      } else {
-        print "[cachyos-v3]"
-        print "Include = /etc/pacman.d/cachyos-v3-mirrorlist"
-        print ""
-        print "[cachyos-core-v3]"
-        print "Include = /etc/pacman.d/cachyos-v3-mirrorlist"
-        print ""
-        print "[cachyos-extra-v3]"
-        print "Include = /etc/pacman.d/cachyos-v3-mirrorlist"
-      }
+      print "# CachyOS optimized repositories (generic x86_64, stock-pacman safe)"
+      print "[cachyos]"
+      print "Include = /etc/pacman.d/cachyos-mirrorlist"
+      print ""
+      print "[cachyos-core]"
+      print "Include = /etc/pacman.d/cachyos-mirrorlist"
+      print ""
+      print "[cachyos-extra]"
+      print "Include = /etc/pacman.d/cachyos-mirrorlist"
     }
-
-    BEGIN {
-      inserted = 0
-      in_cachyos = 0
-      skip_cachyos_comment = 0
-      saw_artix = 0
-    }
-
+    BEGIN { inserted=0; in_cachyos=0; skip=0; saw_artix=0 }
     {
-      # Stock pacman does not infer v3/v4 from "auto"; list every tier arch
-      # explicitly so tier-tagged packages are accepted.
-      if ($0 ~ /^Architecture[[:space:]]*=/) {
-        $0 = "Architecture = auto"
-      }
-
-      if ($0 == "# CachyOS optimized repositories") {
-        skip_cachyos_comment = 1
-        next
-      }
-      if (skip_cachyos_comment) {
-        if ($0 == "" || $0 ~ /^# \[cachyos\] is intentionally omitted/) {
-          next
-        }
-        skip_cachyos_comment = 0
-      }
-
+      if ($0 ~ /^# CachyOS optimized repositories/) { skip=1; next }
+      if (skip) { if ($0=="" || $0 ~ /^#/) next; skip=0 }
       if (is_section($0)) {
-        if (in_cachyos) {
-          in_cachyos = 0
-        }
-
-        if (is_cachyos_repo($0)) {
-          in_cachyos = 1
-          next
-        }
-
-        if (is_artix_repo($0)) {
-          saw_artix = 1
-        } else if (saw_artix && !inserted) {
-          emit_repos()
-          inserted = 1
-        } else if (!saw_artix && !inserted && $0 != "[options]") {
-          emit_repos()
-          inserted = 1
-        }
-      } else if (in_cachyos) {
-        next
-      }
-
+        if (in_cachyos) in_cachyos=0
+        if (is_cachyos_repo($0)) { in_cachyos=1; next }
+        if (is_artix_repo($0)) saw_artix=1
+        else if (!inserted) { emit_repos(); inserted=1 }
+      } else if (in_cachyos) next
       print
     }
-
-    END {
-      if (!inserted) {
-        emit_repos()
-      }
-    }
+    END { if (!inserted) emit_repos() }
   ' "$pacman_conf" > "$tmp" || die "failed to update pacman.conf"
-
   mv "$tmp" "$pacman_conf"
 
-  if grep -Eq '^\[(cachyos|cachyos-core|cachyos-extra)\]$' "$pacman_conf"; then
-    die "custom CachyOS system repository found in pacman.conf"
-  fi
-
-  # Sync databases after the key and repository configuration are complete.
+  # artix repos stay first in conf, so pacman/keys/etc always resolve from
+  # artix; cachyos only supplies what artix doesn't have.
   chroot_raw pacman -Sy || die "failed to sync pacman databases"
-
-  local primary_repo
-  case "$tier" in
-    znver4) primary_repo="cachyos-znver4" ;;
-    v4) primary_repo="cachyos-v4" ;;
-    v3) primary_repo="cachyos-v3" ;;
-  esac
-  chroot_raw pacman -Sl "$primary_repo" >/dev/null 2>&1 || die "CachyOS repository is unavailable: $primary_repo"
+  chroot_raw pacman -Sl cachyos-core >/dev/null 2>&1 || die "CachyOS repository unavailable"
 }
 
 # Refresh package list cache for install_pkgs/install_first_found to use
@@ -817,8 +706,10 @@ install_first_found() {
   local p
   for p in "$@"; do
     if grep -Fxq "$p" "$WORKDIR/pkglist" 2>/dev/null; then
-      install_pkgs "$p"
-      return $?
+      if install_pkgs "$p"; then
+        return 0
+      fi
+      warn "$p failed, trying next candidate"
     fi
   done
   return 1
