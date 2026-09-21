@@ -276,7 +276,10 @@ select_disk() {
 confirm_format() {
   printf '\n\e[1;31mWARNING: %s will be completely erased.\e[0m\n' "$DISK"
   printf '\e[1;31mLUKS + btrfs + new partitions will be written.\e[0m\n\n'
-  read -rp "type YES to continue: " ans || die "eof/aborted"
+  local ans=""
+  while [[ -z "$ans" ]]; do
+    read -rp "type YES to continue (Enter alone re-asks, anything else aborts): " ans || die "eof/aborted"
+  done
   [[ "$ans" == "YES" ]] || die "aborted"
 }
 
@@ -291,17 +294,14 @@ check_disk_space() {
   info "disk size: ${disk_size_gib}GiB"
 }
 
-# Check for existing/open LUKS container and close it if found
 check_existing_luks() {
   info "checking for existing LUKS"
-  # Close any pre-existing cryptroot
   if [[ -e /dev/mapper/cryptroot ]]; then
     warn "closing existing /dev/mapper/cryptroot"
     cryptsetup close cryptroot || true
+    dmsetup remove --force cryptroot 2>/dev/null || true
   fi
 
-  # Determine the root partition that partition_disk will create, so an
-  # existing LUKS header can be reported before the destructive confirmation.
   local expected_root_part
   if [[ "$UEFI" -eq 1 ]]; then
     expected_root_part="$(part_path 2)"
@@ -314,6 +314,33 @@ check_existing_luks() {
   fi
 }
 
+cleanup_umount() {
+  info "unmounting"
+  sync
+  if grep -qs "$MOUNT/swap/swapfile" /proc/swaps; then
+    swapoff "$MOUNT/swap/swapfile" || true
+  fi
+
+  local m tries
+  for m in $(awk -v mnt="$MOUNT" '$2 == mnt || index($2, mnt "/") == 1 {print $2}' /proc/mounts | sort -r); do
+    for tries in 1 2; do
+      umount "$m" 2>/dev/null && break
+      [[ "$tries" -eq 2 ]] && umount -l "$m" 2>/dev/null
+    done
+  done
+  umount "$MOUNT" 2>/dev/null || umount -l "$MOUNT" 2>/dev/null || true
+
+  tries=0
+  until cryptsetup close cryptroot 2>/dev/null || [[ "$tries" -ge 3 ]]; do
+    tries=$((tries + 1))
+    sleep 1
+  done
+  # close can't remove a suspended device with a failed table; dmsetup can.
+  # without this every failed run costs a live-ISO reboot.
+  dmsetup remove --force cryptroot 2>/dev/null || true
+  cryptsetup close cryptroot 2>/dev/null || warn "cryptroot still open — reboot live to clear"
+  CLEANED_UP=1
+}
 # Get partition path accounting for NVMe (pN) vs SCSI (N) naming
 part_path() {
   case "$DISK" in
@@ -345,10 +372,10 @@ partition_disk() {
     BOOT_PART="$(part_path 1)"
     ROOT_PART="$(part_path 2)"
   else
-    # BIOS: 2 MiB bios_grub + 1 GiB ext4 boot + rest for LUKS root
+    # BIOS: 2 MiB bios_boot + 1 GiB FAT32 boot + rest for LUKS root
     parted -s "$DISK" mkpart bios 1MiB 3MiB
     parted -s "$DISK" set 1 bios_grub on
-    parted -s "$DISK" mkpart boot ext4 3MiB 1027MiB
+    parted -s "$DISK" mkpart boot fat32 3MiB 1027MiB
     parted -s "$DISK" mkpart root 1027MiB 100%
     partprobe "$DISK" || warn "partprobe failed, relying on udev"
     sleep 2
@@ -365,11 +392,11 @@ partition_disk() {
 setup_filesystems() {
   info "creating filesystems"
 
-  # Format boot partition: FAT32 for UEFI, ext4 for BIOS
+  # Limine 12 reads FAT volumes; use FAT32 for both boot modes.
   if [[ "$UEFI" -eq 1 ]]; then
     mkfs.vfat -F32 -n ARTIXEFI "$BOOT_PART"
   else
-    mkfs.ext4 -F -L artixboot "$BOOT_PART"
+    mkfs.vfat -F32 -n ARTIXBOOT "$BOOT_PART"
   fi
 
   # Create LUKS2 container with strong encryption parameters:
@@ -864,7 +891,8 @@ install_official_packages() {
   info "installing desktop apps from official repos"
   install_pkgs \
     thunar kitty obs-studio btop gimp bluez bluez-utils blueberry \
-    sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza || true
+    sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza \
+    gram obsidian librewolf bun anki || true
 
   info "installing music stack (official repos)"
   install_pkgs mpd ncmpcpp starship || true
@@ -898,7 +926,15 @@ install_official_packages() {
   esac
 
   info "installing bootloader packages"
-  install_pkgs limine efibootmgr || true
+  chroot_raw pacman -Si limine >/dev/null 2>&1 \
+    || die "limine package not found in configured repositories"
+  install_pkgs limine || die "failed to install limine"
+
+  if [[ "$UEFI" -eq 1 ]]; then
+    chroot_raw pacman -Si efibootmgr >/dev/null 2>&1 \
+      || warn "efibootmgr package not found; UEFI fallback boot may be unavailable"
+    install_pkgs efibootmgr || warn "failed to install efibootmgr"
+  fi
 
   info "installing snapshot + cron packages"
   install_pkgs snapper cronie || true
@@ -1255,42 +1291,101 @@ EOF
   # Hook script: reinstall limine to disk/ESP
   cat > "$MOUNT/usr/local/bin/limine-kernel-update.sh" <<'EOF'
 #!/bin/sh
-# Reinstall limine boot files after kernel update
-# Called by pacman hook on kernel/initramfs upgrades
+# Reinstall Limine boot files after kernel/initramfs updates.
 
-DISK=""
-# Detect boot disk from current root
-if [ -f /proc/cmdline ]; then
-  # Parse cryptdevice=UUID= from cmdline to find the physical disk
-  LUKS_UUID=$(sed -n 's/.*cryptdevice=UUID=\([^:]*\):.*/\1/p' /proc/cmdline)
-  PART=$(blkid -U "$LUKS_UUID" 2>/dev/null)
-  DISK=$(lsblk -no PKNAME "$PART" 2>/dev/null | head -1)
-fi
+if [ -d /sys/firmware/efi ]; then
+  case "$(uname -m)" in
+    aarch64) EFI_BIN=/usr/share/limine/BOOTAA64.EFI; EFI_NAME=BOOTAA64.EFI ;;
+    riscv64) EFI_BIN=/usr/share/limine/BOOTRISCV64.EFI; EFI_NAME=BOOTRISCV64.EFI ;;
+    loongarch64) EFI_BIN=/usr/share/limine/BOOTLOONGARCH64.EFI; EFI_NAME=BOOTLOONGARCH64.EFI ;;
+    i[3456]86) EFI_BIN=/usr/share/limine/BOOTIA32.EFI; EFI_NAME=BOOTIA32.EFI ;;
+    *) EFI_BIN=/usr/share/limine/BOOTX64.EFI; EFI_NAME=BOOTX64.EFI ;;
+  esac
 
-if [ -z "$DISK" ]; then
-  # Fallback: try to find from limine.conf or just exit
-  echo "Could not determine boot disk, skipping limine reinstall"
+  [ -f "$EFI_BIN" ] || {
+    echo "Limine EFI binary not found: $EFI_BIN"
+    exit 1
+  }
+
+  ESP=/boot
+  CONF=$ESP/limine/limine.conf
+  [ -f "$CONF" ] || {
+    echo "Limine config not found: $CONF"
+    exit 1
+  }
+
+  mkdir -p "$ESP/EFI/limine" "$ESP/EFI/BOOT" || exit 1
+  cp "$EFI_BIN" "$ESP/EFI/limine/limine.efi" || exit 1
+  cp "$EFI_BIN" "$ESP/EFI/BOOT/$EFI_NAME" || exit 1
+  cp "$CONF" "$ESP/limine.conf" || exit 1
+  cp "$CONF" "$ESP/EFI/limine/limine.conf" || exit 1
+  cp "$CONF" "$ESP/EFI/BOOT/limine.conf" || exit 1
+
+  for path in \
+    "$ESP/EFI/limine/limine.efi" \
+    "$ESP/EFI/BOOT/$EFI_NAME" \
+    "$ESP/limine.conf" \
+    "$ESP/EFI/limine/limine.conf" \
+    "$ESP/EFI/BOOT/limine.conf"; do
+    [ -s "$path" ] || {
+      echo "Limine boot artifact missing: $path"
+      exit 1
+    }
+  done
+  for path in \
+    "$ESP/limine.conf" \
+    "$ESP/EFI/limine/limine.conf" \
+    "$ESP/EFI/BOOT/limine.conf"; do
+    cmp -s "$CONF" "$path" || {
+      echo "Limine config copy mismatch: $path"
+      exit 1
+    }
+  done
+
+  echo "Limine EFI boot files reinstalled"
   exit 0
 fi
 
-if [ -d /sys/firmware/efi ]; then
-  # UEFI: copy EFI binary and config to ESP
-  EFI_BIN=$(find /usr/share/limine -maxdepth 1 -name '*.efi' 2>/dev/null | head -1)
-  if [ -n "$EFI_BIN" ]; then
-    ESP="/boot"
-    mkdir -p "$ESP/EFI/limine" "$ESP/EFI/BOOT"
-    cp "$EFI_BIN" "$ESP/EFI/limine/limine.efi"
-    cp "$EFI_BIN" "$ESP/EFI/BOOT/BOOTX64.EFI"
-    # ship config to both locations for limine version compatibility
-    [ -f "$ESP/limine/limine.conf" ] && cp "$ESP/limine/limine.conf" "$ESP/limine.conf"
-    [ -f "$ESP/limine/limine.conf" ] && cp "$ESP/limine/limine.conf" "$ESP/EFI/limine/limine.conf"
-    echo "Limine EFI reinstalled"
-  fi
-else
-  # BIOS: reinstall to MBR
-  limine bios-install "$DISK"
-  echo "Limine BIOS reinstalled on $DISK"
-fi
+BOOT_SOURCE=$(findmnt -n -o SOURCE --target /boot 2>/dev/null || true)
+[ -n "$BOOT_SOURCE" ] || {
+  echo "Could not determine the boot partition"
+  exit 1
+}
+
+DISK_NAME=$(lsblk -no PKNAME "$BOOT_SOURCE" 2>/dev/null | head -n1)
+[ -n "$DISK_NAME" ] || {
+  echo "Could not determine the boot disk from $BOOT_SOURCE"
+  exit 1
+}
+case "$DISK_NAME" in
+  /*) DISK=$DISK_NAME ;;
+  *) DISK=/dev/$DISK_NAME ;;
+esac
+
+BIOS_SYS=/usr/share/limine/limine-bios.sys
+CONF=/boot/limine/limine.conf
+[ -f "$BIOS_SYS" ] || {
+  echo "Limine BIOS stage not found: $BIOS_SYS"
+  exit 1
+}
+[ -f "$CONF" ] || {
+  echo "Limine config not found: $CONF"
+  exit 1
+}
+
+mkdir -p /boot/limine || exit 1
+cp "$BIOS_SYS" /boot/limine/limine-bios.sys || exit 1
+cmp -s "$BIOS_SYS" /boot/limine/limine-bios.sys || {
+  echo "Limine BIOS stage copy mismatch"
+  exit 1
+}
+
+limine bios-install "$DISK" 1 || {
+  echo "Limine BIOS install failed"
+  exit 1
+}
+
+echo "Limine BIOS boot files reinstalled"
 EOF
 
   chmod +x "$MOUNT/usr/local/bin/limine-kernel-update.sh"
@@ -1429,10 +1524,10 @@ configure_bootloader() {
 
   cat > "$MOUNT/boot/limine/limine.conf" <<EOF
 timeout: 5
-default: 0
+default_entry: 1
 $wall_line
 
-:CachyOS Artix
+/CachyOS Artix
     protocol: linux
     kernel_path: boot():/$kernel_file
     cmdline: $cmdline
@@ -1440,10 +1535,13 @@ $ucode_line
     module_path: boot():/$initrd_file
 EOF
 
-  # source-conf checks ONLY here; copies are verified after they exist
-  if ! grep -q '^:' "$MOUNT/boot/limine/limine.conf" \
-     || ! grep -q 'kernel_path:' "$MOUNT/boot/limine/limine.conf"; then
-    die "limine.conf has no boot entry — heredoc mangled?"
+  local limine_conf="$MOUNT/boot/limine/limine.conf"
+  if ! grep -q '^/' "$limine_conf" \
+     || ! grep -q '^default_entry:' "$limine_conf" \
+     || ! grep -q 'protocol: linux' "$limine_conf" \
+     || ! grep -q 'kernel_path:' "$limine_conf" \
+     || ! grep -q 'module_path:' "$limine_conf"; then
+    die "limine.conf has no complete boot entry — heredoc mangled?"
   fi
   [[ -f "$MOUNT/boot/$kernel_file" ]]  || die "kernel $kernel_file not on ESP"
   [[ -f "$MOUNT/boot/$initrd_file" ]]  || die "initramfs $initrd_file not on ESP"
@@ -1461,30 +1559,33 @@ EOF
       mkdir -p "$MOUNT/boot/EFI/limine" "$MOUNT/boot/EFI/BOOT"
       cp "$efi_src" "$MOUNT/boot/EFI/limine/limine.efi"
       cp "$efi_src" "$MOUNT/boot/EFI/BOOT/$efi_name"
-      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/limine.conf"
-      cp "$MOUNT/boot/limine/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"
+      cp "$limine_conf" "$MOUNT/boot/limine.conf"
+      cp "$limine_conf" "$MOUNT/boot/EFI/limine/limine.conf"
+      cp "$limine_conf" "$MOUNT/boot/EFI/BOOT/limine.conf"
 
-      # verify on-disk AFTER the copies; silent absence was the old failure mode
+      # Verify every boot artifact before unmounting the ESP.
       local missing=0 f
       for f in "$MOUNT/boot/EFI/BOOT/$efi_name" \
                "$MOUNT/boot/EFI/limine/limine.efi" \
                "$MOUNT/boot/limine.conf" \
-               "$MOUNT/boot/EFI/limine/limine.conf"; do
-        if [[ ! -f "$f" ]]; then
+               "$MOUNT/boot/EFI/limine/limine.conf" \
+               "$MOUNT/boot/EFI/BOOT/limine.conf"; do
+        if [[ ! -s "$f" ]]; then
           warn "missing on ESP: $f"
           missing=1
         fi
       done
-      # byte-identical cp can't mangle content, so this is a warn not a die
-      for f in "$MOUNT/boot/limine.conf" "$MOUNT/boot/EFI/limine/limine.conf"; do
-        if [[ -f "$f" ]] && ! grep -q '^:' "$f"; then
-          warn "copied config missing entry: $f"
+      for f in "$MOUNT/boot/limine.conf" \
+               "$MOUNT/boot/EFI/limine/limine.conf" \
+               "$MOUNT/boot/EFI/BOOT/limine.conf"; do
+        if ! cmp -s "$limine_conf" "$f"; then
+          warn "config copy mismatch on ESP: $f"
           missing=1
         fi
       done
       if (( missing )); then
         ls -laR "$MOUNT/boot" >&2 || true
-        FAILED+=("limine-esp-incomplete")
+        die "limine config was not installed completely"
       fi
 
       if command -v efibootmgr >/dev/null 2>&1; then
@@ -1503,11 +1604,22 @@ EOF
         fi
       fi
     else
-      warn "limine efi binary ($efi_name) not found in target — limine package missing?"
-      FAILED+=("limine-efi-binary")
+      die "limine EFI binary ($efi_name) not found in target — limine package missing?"
     fi
   else
-    chroot_raw limine bios-install "$DISK" || warn "limine bios install failed"
+    local bios_sys="$MOUNT/usr/share/limine/limine-bios.sys"
+    [[ -s "$bios_sys" ]] || die "limine BIOS stage not found in target — limine package missing?"
+    mkdir -p "$MOUNT/boot/limine"
+    cp "$bios_sys" "$MOUNT/boot/limine/limine-bios.sys" \
+      || die "failed to copy limine BIOS stage to boot partition"
+    cmp -s "$bios_sys" "$MOUNT/boot/limine/limine-bios.sys" \
+      || die "limine BIOS stage copy verification failed"
+    [[ -s "$MOUNT/boot/limine/limine.conf" ]] \
+      || die "limine.conf missing from BIOS boot partition"
+
+    # Partition 1 is the GPT bios_boot partition created above.
+    chroot_raw limine bios-install "$DISK" 1 \
+      || die "limine BIOS install failed"
   fi
 }
 
@@ -1791,10 +1903,10 @@ install_aur_packages() {
 
   # first-choice variant per app; ONE aura transaction for all of them
   local want=(
-    gram-bin obsidian-bin betterbird-bin librewolf-bin opentubex-git greenclip
+    betterbird-bin opentubex-bin rofi-greenclip
     bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2
     ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-times-new-roman
-    ttf-arial-rounded-mt onlyoffice anki-bin bun-bin
+    ttf-arial-rounded-mt onlyoffice-bin
   )
 
   local todo=() p
@@ -1812,12 +1924,9 @@ install_aur_packages() {
   for p in "${want[@]}"; do
     chroot_raw pacman -Q "$p" >/dev/null 2>&1 && continue
     case "$p" in
-      gram-bin)          aur_try gram-bin gram-git gram-editor-bin gram-editor-git gram-editor gram || FAILED+=("aur: gram") ;;
-      obsidian-bin)      aur_try obsidian-bin obsidian obsidian-appimage || FAILED+=("aur: obsidian") ;;
-      betterbird-bin)    aur_try betterbird-bin betterbird betterbird-beta-bin || FAILED+=("aur: betterbird") ;;
-      librewolf-bin)     aur_try librewolf-bin librewolf librewolf-appimage || FAILED+=("aur: librewolf") ;;
-      opentubex-git)     aur_try opentubex-git opentubex-bin opentubex || FAILED+=("aur: opentubex") ;;
-      greenclip)         aur_try greenclip || FAILED+=("aur: greenclip") ;;
+      betterbird-bin)    aur_try betterbird-git betterbird betterbird-beta-bin || FAILED+=("aur: betterbird") ;;
+      opentubex-bin)     aur_try opentubex-git || FAILED+=("aur: opentubex") ;;
+      rofi-greenclip)   aur_try rofi-greenclip || FAILED+=("aur: rofi-greenclip") ;;
       bibata-cursor-theme-bin) aur_try bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme") ;;
       qogir-icon-theme)  aur_try qogir-icon-theme || FAILED+=("aur: qogir-icon-theme") ;;
       betterlockscreen)  aur_try betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen") ;;
@@ -1826,13 +1935,7 @@ install_aur_packages() {
       ttf-jetbrains-mono-nerd) aur_try ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
       ttf-times-new-roman) aur_try ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman") ;;
       ttf-arial-rounded-mt) aur_try ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt") ;;
-      onlyoffice)        aur_try onlyoffice || FAILED+=("aur: onlyoffice") ;;
-      anki-bin)          if grep -Fxq anki "$WORKDIR/pkglist" 2>/dev/null; then
-                           install_pkgs anki || aur_try anki-bin || FAILED+=("anki")
-                         else
-                           aur_try anki-bin || FAILED+=("aur: anki")
-                         fi ;;
-      bun-bin)           aur_try bun-bin bun || FAILED+=("aur: bun") ;;
+      onlyoffice-bin)    aur_try onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
     esac
   done
 }
