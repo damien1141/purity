@@ -859,7 +859,7 @@ install_official_packages() {
     xorg-server xorg-xinit xorg-xrandr xorg-xsetroot xorg-xinput xorg-xrdb \
     xorg-xkill xorg-xdpyinfo xterm xorg-fonts-misc ttf-dejavu || true
 
-  info "installing wm + lua"
+  info "installing lua"
   install_pkgs lua lua54 luarocks || install_pkgs lua luarocks || true
 
   info "installing desktop apps from official repos"
@@ -1401,7 +1401,7 @@ system_update() {
     warn "aura unavailable, skipping system update"
     return 0   # was: return 1 — under set -e that aborted the install at 99%
   fi
-  chroot_exec "sudo -u $USERNAME bash -lc 'aura -Syyu --noconfirm'" || warn "aura -Syyu failed"
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -Syyu --noconfirm --skippgpcheck --nocheck'" || warn "aura -Syyu failed"
   return 0
 }
 
@@ -1790,7 +1790,7 @@ build_aura() {
   }
 
   # Build with makepkg -s (installs build deps, builds PKGBIN)
-  chroot_exec "sudo -u $USERNAME bash -lc 'cd ~/src/aura && makepkg -s --noconfirm'" || {
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'cd ~/src/aura && makepkg -s --noconfirm --skippgpcheck --nocheck'" || {
     remove_aura_sudoers
     FAILED+=("aura: makepkg failed")
     return 1
@@ -1841,7 +1841,7 @@ build_jaiba() {
   chroot_raw chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/src"
 
   # Build jaiba in release mode with locked dependencies
-  chroot_exec "sudo -u $USERNAME bash -lc 'cd ~/src/jaiba && PATH=\"\$HOME/.cargo/bin:\$PATH\" cargo build --release --locked'" || {
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'cd ~/src/jaiba && PATH=\"\$HOME/.cargo/bin:\$PATH\" cargo build --release --locked'" || {
     remove_aura_sudoers
     FAILED+=("jaiba: cargo build failed")
     return 1
@@ -1918,7 +1918,7 @@ aur_install_one() {
 
   printf -v build_arg '%q' "$AUR_BUILD_DIR"
   printf -v pkg_arg '%q' "$pkg"
-  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --build $build_arg --noconfirm $pkg_arg'"
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -A --build $build_arg --noconfirm --skippgpcheck --nocheck $pkg_arg'"
 }
 
 # Aura stops a build layer on the first failed package. Refresh its checksums
@@ -1945,7 +1945,7 @@ aur_retry_pkgsums() {
   fi
 
   info "retrying $pkg with makepkg -si"
-  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'cd \"$build_dir\" && makepkg -si --noconfirm'"
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'cd \"$build_dir\" && makepkg -si --noconfirm --skippgpcheck --nocheck'"
 }
 
 aur_try() {
@@ -2028,7 +2028,7 @@ install_aur_packages() {
     printf -v pkg_list '%s ' "${pkg_args[@]}"
 
     info "aura batch (${#todo[@]} pkgs): ${todo[*]}"
-    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --build $AUR_BUILD_DIR --noconfirm $pkg_list'" \
+    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -A --build $AUR_BUILD_DIR --noconfirm --skippgpcheck --nocheck $pkg_list'" \
       || warn "aura batch reported failures — resolving misses below"
   fi
 
