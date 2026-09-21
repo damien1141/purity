@@ -860,7 +860,7 @@ install_official_packages() {
     xorg-xkill xorg-xdpyinfo xterm xorg-fonts-misc ttf-dejavu || true
 
   info "installing wm + lua"
-  install_pkgs awesome lua lua54 luarocks || install_pkgs awesome lua luarocks || true
+  install_pkgs lua lua54 luarocks || install_pkgs lua luarocks || true
 
   info "installing desktop apps from official repos"
   install_pkgs \
@@ -2003,13 +2003,13 @@ install_aur_packages() {
     return 0
   fi
 
-  if ! chroot_raw pacman -Q awesome >/dev/null 2>&1; then
-    aur_try awesome || FAILED+=("aur: awesome")
+  if ! chroot_raw pacman -Q awesomewm-git >/dev/null 2>&1; then
+    aur_try awesomewm-git || FAILED+=("aur: awesomewm-git")
   fi
 
   # first-choice variant per app; ONE aura transaction for all of them
   local want=(
-    betterbird-bin opentubex-bin rofi-greenclip
+    awesomewm-git betterbird-bin opentubex-bin rofi-greenclip
     bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2
     ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-ms-fonts onlyoffice-bin
   )
@@ -2046,6 +2046,7 @@ install_aur_packages() {
       ttf-harmonyos-sans) aur_recover_pkg ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
       ttf-jetbrains-mono-nerd) aur_recover_pkg ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
       ttf-ms-fonts) aur_recover_pkg ttf-ms-fonts || FAILED+=("aur: ttf-ms-fonts") ;;
+      awesomewm-git) aur_recover_pkg awesomewm-git || FAILED+=("aur: awesomewm-git") ;;
       onlyoffice-bin)    aur_recover_pkg onlyoffice-bin onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
     esac
   done
