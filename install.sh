@@ -59,6 +59,7 @@ INSTALL_SSH=1           # Whether to install openssh (1=yes, 0=no)
 FAILED=()               # Array of failure messages for final report
 CLEANED_UP=0            # Flag: cleanup already performed (prevents double-unmount)
 AUR_JOBS=2              # aggregate build pressure cap; swap handles per-process peaks
+AUR_BUILD_DIR="/tmp/aura-build" # target build root used by Aura and pkgsums retries
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -314,33 +315,6 @@ check_existing_luks() {
   fi
 }
 
-cleanup_umount() {
-  info "unmounting"
-  sync
-  if grep -qs "$MOUNT/swap/swapfile" /proc/swaps; then
-    swapoff "$MOUNT/swap/swapfile" || true
-  fi
-
-  local m tries
-  for m in $(awk -v mnt="$MOUNT" '$2 == mnt || index($2, mnt "/") == 1 {print $2}' /proc/mounts | sort -r); do
-    for tries in 1 2; do
-      umount "$m" 2>/dev/null && break
-      [[ "$tries" -eq 2 ]] && umount -l "$m" 2>/dev/null
-    done
-  done
-  umount "$MOUNT" 2>/dev/null || umount -l "$MOUNT" 2>/dev/null || true
-
-  tries=0
-  until cryptsetup close cryptroot 2>/dev/null || [[ "$tries" -ge 3 ]]; do
-    tries=$((tries + 1))
-    sleep 1
-  done
-  # close can't remove a suspended device with a failed table; dmsetup can.
-  # without this every failed run costs a live-ISO reboot.
-  dmsetup remove --force cryptroot 2>/dev/null || true
-  cryptsetup close cryptroot 2>/dev/null || warn "cryptroot still open — reboot live to clear"
-  CLEANED_UP=1
-}
 # Get partition path accounting for NVMe (pN) vs SCSI (N) naming
 part_path() {
   case "$DISK" in
@@ -862,7 +836,7 @@ install_official_packages() {
   install_pkgs \
     sudo cryptsetup btrfs-progs dosfstools e2fsprogs util-linux pciutils \
     curl wget git rsync vim nano fish bash-completion man-db man-pages \
-    openssl pkgconf python rustup || true
+    openssl pkgconf python rustup tzdata pacman-contrib || true
 
   info "installing runit service packages"
   install_pkgs \
@@ -1182,8 +1156,8 @@ EOF
   if [[ "$DNSMASQ_WHITELIST" -eq 0 ]]; then
     cat > "$MOUNT/etc/dnsmasq.conf" <<'EOF'
 no-resolv
-server=127.0.0.1#5354
-server=[::1]#5354
+server=/#/127.0.0.1#5354
+server=/#/::1#5354
 listen-address=127.0.0.1
 listen-address=::1
 conf-dir=/etc/dnsmasq.d,.conf
@@ -1220,7 +1194,7 @@ configure_ntp() {
 
   # openntpd config: pool.ntp.org, slew-only time correction
   cat > "$MOUNT/etc/ntpd.conf" <<'EOF'
-pool pool.ntp.org
+servers pool.ntp.org
 offset_correction_interval yes
 slew only
 EOF
@@ -1405,18 +1379,19 @@ verify_timesync() {
 cleanup_aur_builds() {
   info "cleaning aur build artifacts"
   if [[ -t 0 ]]; then
-    read -rp "remove aura/jaiba source and build dirs (~/src)? [Y/n]: " input || input="n"
+    read -rp "remove aura/jaiba source and /tmp/aura-build dirs? [Y/n]: " input || input="n"
   else
-    info "non-interactive terminal: keeping ~/src"
+    info "non-interactive terminal: keeping aura build artifacts"
     return 0
   fi
 
   if [[ "$input" =~ ^[Nn]$ ]]; then
-    info "keeping ~/src"
+    info "keeping aura build artifacts"
     return 0
   fi
   chroot_raw rm -rf "/home/$USERNAME/src" || warn "failed to remove ~/src"
-  info "removed ~/src"
+  chroot_raw rm -rf "$AUR_BUILD_DIR" || warn "failed to remove $AUR_BUILD_DIR"
+  info "removed aura build artifacts"
 }
 
 # Update system using aura (AUR helper)
@@ -1878,14 +1853,119 @@ build_jaiba() {
   chroot_raw jaiba --version || true
 }
 
+# Locate the Aura build directory for a requested package.
+# Aura names build directories after pkgbase, which can differ from pkgname
+# for split packages. Aura retains PKGBUILD in the build directory but does not
+# necessarily copy .SRCINFO there.
+aur_build_dir_for_pkg() {
+  local pkg="$1"
+  local candidate="$AUR_BUILD_DIR/$pkg"
+  local dir
+
+  if [[ -f "$MOUNT$candidate/PKGBUILD" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for dir in "$MOUNT$AUR_BUILD_DIR"/*; do
+    [[ -f "$dir/PKGBUILD" ]] || continue
+    if awk -v pkg="$pkg" '
+      /^[[:space:]]*(pkgbase|pkgname)[[:space:]]*=/ {
+        line = $0
+        sub(/^[[:space:]]*/, "", line)
+        sub(/^[^=]*=/, "", line)
+        gsub(/\047/, " ", line)
+        gsub(/[(){}"]/, "", line)
+        count = split(line, names, /[[:space:]]+/)
+        for (i = 1; i <= count; i++) {
+          if (names[i] == pkg) {
+            found = 1
+          }
+        }
+      }
+      END { exit(found ? 0 : 1) }
+    ' "$dir/PKGBUILD"; then
+      printf '%s\n' "${dir#"$MOUNT"}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+# Run one Aura AUR installation attempt in the dedicated build directory.
+aur_install_one() {
+  local pkg="$1"
+  local build_arg pkg_arg
+
+  printf -v build_arg '%q' "$AUR_BUILD_DIR"
+  printf -v pkg_arg '%q' "$pkg"
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --build $build_arg --noconfirm $pkg_arg'"
+}
+
+# Aura stops a build layer on the first failed package. Refresh its checksums
+# and install directly from the retained build directory before trying another
+# package variant.
+aur_retry_pkgsums() {
+  local pkg="$1"
+  local build_dir
+
+  if ! build_dir="$(aur_build_dir_for_pkg "$pkg")"; then
+    warn "aura build failed for $pkg; no build directory found under $AUR_BUILD_DIR"
+    return 1
+  fi
+
+  if ! chroot_exec "command -v updpkgsums >/dev/null 2>&1"; then
+    warn "aura build failed for $pkg; updpkgsums is unavailable (pacman-contrib is not installed)"
+    return 1
+  fi
+
+  info "refreshing pkgsums for $pkg in $build_dir"
+  if ! chroot_exec "sudo -u $USERNAME bash -lc 'cd \"$build_dir\" && updpkgsums'"; then
+    warn "updpkgsums failed for $pkg"
+    return 1
+  fi
+
+  info "retrying $pkg with makepkg -si"
+  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'cd \"$build_dir\" && makepkg -si --noconfirm'"
+}
+
 aur_try() {
   local pkg
   for pkg in "$@"; do
-    if chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --noconfirm $pkg'"; then
+    if aur_install_one "$pkg"; then
+      return 0
+    fi
+
+    if aur_retry_pkgsums "$pkg"; then
       return 0
     fi
   done
   return 1
+}
+
+# Recover the failed first-choice package before trying alternate AUR names.
+aur_recover_pkg() {
+  local pkg="$1"
+  shift
+
+  aur_retry_pkgsums "$pkg" && return 0
+  aur_try "$@"
+}
+
+prepare_aur_build_dir() {
+  info "preparing aura build directory"
+  if ! chroot_raw install -d -o "$USERNAME" "$AUR_BUILD_DIR"; then
+    warn "failed to create $AUR_BUILD_DIR"
+    return 1
+  fi
+
+  # Reuse failed builds for the pkgsums retry, including directories left by an
+  # earlier interrupted installation.
+  if ! chroot_raw chown -R "$USERNAME" "$AUR_BUILD_DIR"; then
+    warn "failed to assign $AUR_BUILD_DIR to $USERNAME"
+    return 1
+  fi
 }
 
 install_aur_packages() {
@@ -1894,6 +1974,14 @@ install_aur_packages() {
   if ! chroot_raw aura --version >/dev/null 2>&1; then
     warn "aura unavailable, skipping aur packages"
     FAILED+=("aur: aura unavailable")
+    return 0
+  fi
+
+  # makepkg -si installs dependencies and the rebuilt package through sudo.
+  add_aura_sudoers
+
+  if ! prepare_aur_build_dir; then
+    FAILED+=("aur: build directory unavailable")
     return 0
   fi
 
@@ -1915,8 +2003,15 @@ install_aur_packages() {
   done
 
   if ((${#todo[@]})); then
+    local pkg_arg pkg_args=() pkg_list
+    for p in "${todo[@]}"; do
+      printf -v pkg_arg '%q' "$p"
+      pkg_args+=("$pkg_arg")
+    done
+    printf -v pkg_list '%s ' "${pkg_args[@]}"
+
     info "aura batch (${#todo[@]} pkgs): ${todo[*]}"
-    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --noconfirm ${todo[*]}'" \
+    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS MAKEFLAGS='-j$AUR_JOBS' bash -lc 'aura -A --build $AUR_BUILD_DIR --noconfirm $pkg_list'" \
       || warn "aura batch reported failures — resolving misses below"
   fi
 
@@ -1924,18 +2019,18 @@ install_aur_packages() {
   for p in "${want[@]}"; do
     chroot_raw pacman -Q "$p" >/dev/null 2>&1 && continue
     case "$p" in
-      betterbird-bin)    aur_try betterbird-git betterbird betterbird-beta-bin || FAILED+=("aur: betterbird") ;;
-      opentubex-bin)     aur_try opentubex-git || FAILED+=("aur: opentubex") ;;
-      rofi-greenclip)   aur_try rofi-greenclip || FAILED+=("aur: rofi-greenclip") ;;
-      bibata-cursor-theme-bin) aur_try bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme") ;;
-      qogir-icon-theme)  aur_try qogir-icon-theme || FAILED+=("aur: qogir-icon-theme") ;;
-      betterlockscreen)  aur_try betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen") ;;
-      mpdris2)           aur_try mpdris2 || FAILED+=("aur: mpdris2") ;;
-      ttf-harmonyos-sans) aur_try ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
-      ttf-jetbrains-mono-nerd) aur_try ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
-      ttf-times-new-roman) aur_try ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman") ;;
-      ttf-arial-rounded-mt) aur_try ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt") ;;
-      onlyoffice-bin)    aur_try onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
+      betterbird-bin)    aur_recover_pkg betterbird-bin betterbird-git betterbird betterbird-beta-bin || FAILED+=("aur: betterbird") ;;
+      opentubex-bin)     aur_recover_pkg opentubex-bin opentubex-git || FAILED+=("aur: opentubex") ;;
+      rofi-greenclip)    aur_recover_pkg rofi-greenclip || FAILED+=("aur: rofi-greenclip") ;;
+      bibata-cursor-theme-bin) aur_recover_pkg bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme") ;;
+      qogir-icon-theme)  aur_recover_pkg qogir-icon-theme || FAILED+=("aur: qogir-icon-theme") ;;
+      betterlockscreen)  aur_recover_pkg betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen") ;;
+      mpdris2)           aur_recover_pkg mpdris2 || FAILED+=("aur: mpdris2") ;;
+      ttf-harmonyos-sans) aur_recover_pkg ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
+      ttf-jetbrains-mono-nerd) aur_recover_pkg ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
+      ttf-times-new-roman) aur_recover_pkg ttf-times-new-roman || FAILED+=("aur: ttf-times-new-roman") ;;
+      ttf-arial-rounded-mt) aur_recover_pkg ttf-arial-rounded-mt || FAILED+=("aur: ttf-arial-rounded-mt") ;;
+      onlyoffice-bin)    aur_recover_pkg onlyoffice-bin onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
     esac
   done
 }
@@ -1998,6 +2093,9 @@ cleanup_umount() {
     tries=$((tries + 1))
     sleep 1
   done
+  # close can't remove a suspended device with a failed table; dmsetup can.
+  # without this every failed run costs a live-ISO reboot.
+  dmsetup remove --force cryptroot 2>/dev/null || true
   cryptsetup close cryptroot 2>/dev/null || warn "cryptroot still open — reboot live to clear"
   CLEANED_UP=1
 }
