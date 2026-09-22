@@ -1287,14 +1287,16 @@ cleanup_aur_builds() {
   info "removed aura build artifacts"
 }
 
-# Update system using aura (AUR helper)
+# Update system: repo via pacman, AUR via aura aursync
 system_update() {
-  info "updating system via aura"
-  if ! chroot_raw aura --version >/dev/null 2>&1; then
-    warn "aura unavailable, skipping system update"
-    return 0   # was: return 1 — under set -e that aborted the install at 99%
+  info "updating system"
+  chroot_exec "sudo -u $USERNAME bash -lc 'pacman -Syu --noconfirm'" || warn "pacman -Syu failed"
+  if chroot_raw aura --version >/dev/null 2>&1; then
+    chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -Au --noconfirm'" \
+      || warn "aura -Au failed"
+  else
+    warn "aura unavailable, skipping aur upgrades"
   fi
-  chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -Syyu --noconfirm --skippgpcheck --nocheck'" || warn "aura -Syyu failed"
   return 0
 }
 
@@ -1918,12 +1920,15 @@ install_aur_packages() {
     chroot_raw pacman -Q "$p" >/dev/null 2>&1 || todo+=("$p")
   done
 
-  # optional scoop: some wants may be in the generic cachyos repo
-  install_pkgs "${todo[@]}" || true
-  todo=()
-  for p in "${want[@]}"; do
-    chroot_raw pacman -Q "$p" >/dev/null 2>&1 || todo+=("$p")
-  done
+  # scoop repo-covered wants prebuilt before compiling anything
+  if ((${#todo[@]})); then
+    install_pkgs "${todo[@]}" || true
+    local still=()
+    for p in "${todo[@]}"; do
+      chroot_raw pacman -Q "$p" >/dev/null 2>&1 || still+=("$p")
+    done
+    if ((${#still[@]})); then todo=("${still[@]}"); else todo=(); fi
+  fi
 
   if ((${#todo[@]})); then
     local pkg_arg pkg_args=() pkg_list
