@@ -1290,7 +1290,7 @@ cleanup_aur_builds() {
 # Update system: repo via pacman, AUR via aura aursync
 system_update() {
   info "updating system"
-  chroot_exec "sudo -u $USERNAME bash -lc 'pacman -Syu --noconfirm'" || warn "pacman -Syu failed"
+  chroot_raw pacman -Syu --noconfirm || warn "pacman -Syu failed"
   if chroot_raw aura --version >/dev/null 2>&1; then
     chroot_exec "sudo -u $USERNAME env CARGO_BUILD_JOBS=$AUR_JOBS bash -lc 'aura -Au --noconfirm'" \
       || warn "aura -Au failed"
@@ -1741,7 +1741,12 @@ build_jaiba() {
   # Copy source to user's src directory
   local src="$MOUNT/home/$USERNAME/src/jaiba"
   rm -rf "$src"
-  cp -a "$SCRIPT_DIR/extra/jaiba" "$src"
+  mkdir -p "$MOUNT/home/$USERNAME/src"
+  cp -a "$SCRIPT_DIR/extra/jaiba" "$src" || {
+    remove_aura_sudoers
+    FAILED+=("jaiba: source copy failed")
+    return 1
+  }
   chroot_raw chown -R "$USERNAME:$USERNAME" "/home/$USERNAME/src"
 
   # Build jaiba in release mode with locked dependencies
