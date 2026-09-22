@@ -594,18 +594,30 @@ init_pacman_keys() {
   chroot_raw pacman-key --populate archlinux || true
 }
 
-# Add CachyOS optimized repositories without CachyOS system packages
+preflight_cachyos() {
+  info "preflight: cachyos generic repo reachable"
+  local m db="/repo/x86_64/cachyos/cachyos.db"
+  for m in https://mirror.cachyos.org https://cdn77.cachyos.org https://us.cachyos.org https://at.cachyos.org; do
+    if curl -fsSI "$m$db" >/dev/null 2>&1; then
+      info "cachyos db ok: $m"
+      return 0
+    fi
+  done
+  die "cachyos generic repo 404/unreachable on all mirrors — layout moved again?"
+}
+
+# Add CachyOS optimized repository (generic x86_64, lowest priority)
 configure_repos() {
-  info "adding cachyos optimized repositories (generic x86_64)"
+  info "adding cachyos optimized repository (generic x86_64)"
 
   local pacman_conf="$MOUNT/etc/pacman.conf"
   local mirrorlist_dir="$MOUNT/etc/pacman.d"
   [[ -f "$pacman_conf" ]] || die "pacman.conf not found in target"
   mkdir -p "$mirrorlist_dir"
 
-  # generic path: packages tagged arch=x86_64, stock-pacman safe.
-  # tier repos (x86_64_v3/v4/znver4) tag packages arch=x86_64_v3 which stock
-  # pacman rejects; those need cachyos-pacman. see todo.md decision log.
+  # generic layout is ONE merged repo: /repo/x86_64/cachyos. there is no
+  # cachyos-core / cachyos-extra at this path (404 observed 2026-09-22).
+  # packages tagged x86_64/any — stock-pacman safe.
   cat > "$mirrorlist_dir/cachyos-mirrorlist" <<'EOF'
 Server = https://cdn77.cachyos.org/repo/x86_64/$repo
 Server = https://us.cachyos.org/repo/x86_64/$repo
@@ -622,47 +634,37 @@ EOF
     cp -a "$pacman_conf" "$backup"
   fi
 
+  # append [cachyos] at END of pacman.conf = lowest priority, artix wins all
+  # shared-package ties. never insert mid-file: inserting at [options] put
+  # cachyos ahead of artix (observed sync-order bug 2026-09-22).
   local tmp="$pacman_conf.cachyos.new"
   awk '
     function is_section(line) { return line ~ /^\[[^]]+\]$/ }
     function is_cachyos_repo(line) {
       return line ~ /^\[(cachyos|cachyos-core|cachyos-extra|cachyos-v3|cachyos-core-v3|cachyos-extra-v3|cachyos-v4|cachyos-core-v4|cachyos-extra-v4|cachyos-znver4|cachyos-core-znver4|cachyos-extra-znver4)\]$/
     }
-    function is_artix_repo(line) {
-      return line ~ /^\[(system|world|galaxy|lib32|system-gremlins|world-gremlins|galaxy-gremlins|lib32-gremlins|system-goblins|world-goblins|galaxy-goblins|lib32-goblins)\]$/
-    }
-    function emit_repos() {
-      print ""
-      print "# CachyOS optimized repositories (generic x86_64, stock-pacman safe)"
-      print "[cachyos]"
-      print "Include = /etc/pacman.d/cachyos-mirrorlist"
-      print ""
-      print "[cachyos-core]"
-      print "Include = /etc/pacman.d/cachyos-mirrorlist"
-      print ""
-      print "[cachyos-extra]"
-      print "Include = /etc/pacman.d/cachyos-mirrorlist"
-    }
-    BEGIN { inserted=0; in_cachyos=0; skip=0; saw_artix=0 }
+    BEGIN { in_cachyos=0; skip=0 }
     {
-      if ($0 ~ /^# CachyOS optimized repositories/) { skip=1; next }
+      if ($0 ~ /^# CachyOS optimized repositor/) { skip=1; next }
       if (skip) { if ($0=="" || $0 ~ /^#/) next; skip=0 }
       if (is_section($0)) {
         if (in_cachyos) in_cachyos=0
         if (is_cachyos_repo($0)) { in_cachyos=1; next }
-        if (is_artix_repo($0)) saw_artix=1
-        else if (!inserted) { emit_repos(); inserted=1 }
       } else if (in_cachyos) next
       print
     }
-    END { if (!inserted) emit_repos() }
+    END {
+      print ""
+      print "# CachyOS optimized repository (generic x86_64, stock-pacman safe)"
+      print "# appended last: artix repos keep priority for shared packages"
+      print "[cachyos]"
+      print "Include = /etc/pacman.d/cachyos-mirrorlist"
+    }
   ' "$pacman_conf" > "$tmp" || die "failed to update pacman.conf"
   mv "$tmp" "$pacman_conf"
 
-  # artix repos stay first in conf, so pacman/keys/etc always resolve from
-  # artix; cachyos only supplies what artix doesn't have.
   chroot_raw pacman -Sy || die "failed to sync pacman databases"
-  chroot_raw pacman -Sl cachyos-core >/dev/null 2>&1 || die "CachyOS repository unavailable"
+  chroot_raw pacman -Sl cachyos >/dev/null 2>&1 || die "cachyos repository unavailable"
 }
 
 # Refresh package list cache for install_pkgs/install_first_found to use
@@ -750,7 +752,7 @@ install_official_packages() {
     xorg-xkill xorg-xdpyinfo xterm xorg-fonts-misc ttf-dejavu || true
 
   info "installing lua + awesomewm"
-  install_pkgs awesome lua lua53 lua53-lgi luarocks || install_pkgs lua luarocks || true
+  install_pkgs lua lua53 lua53-lgi lua54 lua54-lgi  luarocks || install_pkgs lua luarocks || true
 
   info "installing desktop apps from official repos"
   install_pkgs \
@@ -1670,6 +1672,15 @@ build_aura() {
     return 1
   fi
 
+  # optional scoop: aura may be present in the generic cachyos repo
+  if ! chroot_raw pacman -Q aura >/dev/null 2>&1; then
+    install_pkgs aura || true
+  fi
+  if chroot_raw pacman -Q aura >/dev/null 2>&1; then
+    info "aura installed from repo, skipping AUR build"
+    return 0
+  fi
+
   # Enable passwordless sudo for build user (makepkg -s installs makedepends)
   add_aura_sudoers
 
@@ -1897,11 +1908,19 @@ install_aur_packages() {
   # first-choice variant per app; ONE aura transaction for all of them
   local want=(
     betterbird-bin opentubex-bin rofi-greenclip
-    bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2
+    bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2-git
     ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-ms-fonts onlyoffice-bin
+    awesome-git
   )
 
   local todo=() p
+  for p in "${want[@]}"; do
+    chroot_raw pacman -Q "$p" >/dev/null 2>&1 || todo+=("$p")
+  done
+
+  # optional scoop: some wants may be in the generic cachyos repo
+  install_pkgs "${todo[@]}" || true
+  todo=()
   for p in "${want[@]}"; do
     chroot_raw pacman -Q "$p" >/dev/null 2>&1 || todo+=("$p")
   done
@@ -1929,11 +1948,12 @@ install_aur_packages() {
       bibata-cursor-theme-bin) aur_recover_pkg bibata-cursor-theme-bin || FAILED+=("aur: bibata-cursor-theme") ;;
       qogir-icon-theme)  aur_recover_pkg qogir-icon-theme || FAILED+=("aur: qogir-icon-theme") ;;
       betterlockscreen)  aur_recover_pkg betterlockscreen betterlockscreen-git || FAILED+=("aur: betterlockscreen") ;;
-      mpdris2)           aur_recover_pkg mpdris2 || FAILED+=("aur: mpdris2") ;;
+      mpdris2)           aur_recover_pkg mpdris2-git mpdris2 || FAILED+=("aur: mpdris2") ;;
       ttf-harmonyos-sans) aur_recover_pkg ttf-harmonyos-sans || FAILED+=("aur: ttf-harmonyos-sans") ;;
       ttf-jetbrains-mono-nerd) aur_recover_pkg ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
       ttf-ms-fonts) aur_recover_pkg ttf-ms-fonts || FAILED+=("aur: ttf-ms-fonts") ;;
       onlyoffice-bin)    aur_recover_pkg onlyoffice-bin onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
+      awesome-git)       aur_recover_pkg awesome-git awesome || FAILED+=("aur: awesome") ;;
     esac
   done
 }
@@ -2018,6 +2038,7 @@ main() {
   require_root
   ensure_live_packages
   check_internet
+  preflight_cachyos
   rank_mirrors
   detect_hardware
   ask_user
