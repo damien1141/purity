@@ -33,7 +33,7 @@ kill_if_running "kdeconnectd"
 #kill_if_running "clipcatd"
 kill_if_running "greenclip"
 kill_if_running "xss-loc"
-kill_if_running "thunderbird"
+kill_if_running "betterbird"
 
 # --- X11 Environment & Settings -----------------------------------------------
 

@@ -729,7 +729,8 @@ install_official_packages() {
   install_pkgs \
     sudo cryptsetup btrfs-progs dosfstools e2fsprogs util-linux pciutils \
     curl wget git rsync vim nano fish bash-completion man-db man-pages \
-    openssl pkgconf python rustup tzdata pacman-contrib || true
+    openssl pkgconf python rustup tzdata pacman-contrib \
+    tlp tlp-pd || true
 
   info "installing runit service packages"
   install_pkgs \
@@ -758,7 +759,8 @@ install_official_packages() {
   install_pkgs \
     thunar kitty obs-studio btop gimp bluez bluez-utils blueberry \
     sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza \
-    gram obsidian librewolf bun anki || true
+    gram obsidian librewolf bun anki \
+    picom kdeconnect lxsession nwg-look xss-loc || true
 
   info "installing music stack (official repos)"
   install_pkgs mpd ncmpcpp starship || true
@@ -1762,6 +1764,21 @@ build_jaiba() {
   chroot_raw jaiba --version || true
 }
 
+# Build awesome-git directly from AUR, bypassing aura's resolver on the
+# awesome-git ↔ ldoc circular/stale dependency edge.
+build_awesome_git() {
+  info "building awesome-git (bypassing aura resolver)"
+
+  add_aura_sudoers
+  chroot_exec "sudo -u $USERNAME bash -lc 'rm -rf ~/src/awesome-git && git clone https://aur.archlinux.org/awesome-git.git ~/src/awesome-git && cd ~/src/awesome-git && sed -i \"/ldoc/d\" PKGBUILD && sed -i \"s/GENERATE_DOC=ON/GENERATE_DOC=OFF/\" PKGBUILD && makepkg -si --noconfirm --skippgpcheck --nocheck'" || {
+    remove_aura_sudoers
+    FAILED+=("aur: awesome-git")
+    return 1
+  }
+  remove_aura_sudoers
+  chroot_raw pacman -Q awesome-git >/dev/null 2>&1 || { FAILED+=("aur: awesome-git"); return 1; }
+}
+
 # Locate the Aura build directory for a requested package.
 # Aura names build directories after pkgbase, which can differ from pkgname
 # for split packages. Aura retains PKGBUILD in the build directory but does not
@@ -1899,7 +1916,6 @@ install_aur_packages() {
     betterbird-bin opentubex-bin rofi-greenclip
     bibata-cursor-theme-bin qogir-icon-theme betterlockscreen mpdris2-git
     ttf-harmonyos-sans ttf-jetbrains-mono-nerd ttf-ms-fonts onlyoffice-bin
-    awesome-git
   )
 
   local todo=() p
@@ -1945,7 +1961,6 @@ install_aur_packages() {
       ttf-jetbrains-mono-nerd) aur_recover_pkg ttf-jetbrains-mono-nerd || FAILED+=("aur: ttf-jetbrains-mono-nerd") ;;
       ttf-ms-fonts) aur_recover_pkg ttf-ms-fonts || FAILED+=("aur: ttf-ms-fonts") ;;
       onlyoffice-bin)    aur_recover_pkg onlyoffice-bin onlyoffice-git onlyoffice || FAILED+=("aur: onlyoffice") ;;
-      awesome-git)       aur_recover_pkg awesome-git awesome || FAILED+=("aur: awesome") ;;
     esac
   done
 }
@@ -2074,6 +2089,7 @@ main() {
   setup_rustup || true
   build_aura || true
   build_jaiba || true
+  build_awesome_git || true
   install_aur_packages || true
   remove_aura_sudoers
   cleanup_aur_builds
