@@ -604,6 +604,7 @@ preflight_cachyos() {
 }
 
 # Add CachyOS optimized repository (generic x86_64, lowest priority)
+# Also enable Arch extra and multilib repos for additional packages
 configure_repos() {
   info "adding cachyos optimized repository (generic x86_64)"
 
@@ -622,6 +623,19 @@ Server = https://at.cachyos.org/repo/x86_64/$repo
 Server = https://mirror.cachyos.org/repo/x86_64/$repo
 EOF
 
+  # Arch extra and multilib mirrorlists
+  cat > "$mirrorlist_dir/arch-extra-mirrorlist" <<'EOF'
+Server = https://mirrors.artixlinux.org/archlinux/extra/os/$arch
+Server = https://mirror.rackspace.com/archlinux/extra/os/$arch
+Server = https://mirrors.kernel.org/archlinux/extra/os/$arch
+EOF
+
+  cat > "$mirrorlist_dir/arch-multilib-mirrorlist" <<'EOF'
+Server = https://mirrors.artixlinux.org/archlinux/multilib/os/$arch
+Server = https://mirror.rackspace.com/archlinux/multilib/os/$arch
+Server = https://mirrors.kernel.org/archlinux/multilib/os/$arch
+EOF
+
   local cachyos_key="F3B607488DB35A47"
   chroot_raw pacman-key --recv-keys "$cachyos_key" --keyserver keyserver.ubuntu.com || die "failed to import CachyOS signing key"
   chroot_raw pacman-key --lsign-key "$cachyos_key" || die "failed to sign CachyOS key locally"
@@ -631,7 +645,7 @@ EOF
     cp -a "$pacman_conf" "$backup"
   fi
 
-  # append [cachyos] at END of pacman.conf = lowest priority, artix wins all
+  # append [cachyos], [extra], [multilib] at END of pacman.conf = lowest priority, artix wins all
   # shared-package ties. never insert mid-file: inserting at [options] put
   # cachyos ahead of artix (observed sync-order bug 2026-09-22).
   local tmp="$pacman_conf.cachyos.new"
@@ -640,6 +654,12 @@ EOF
     function is_cachyos_repo(line) {
       return line ~ /^\[(cachyos|cachyos-core|cachyos-extra|cachyos-v3|cachyos-core-v3|cachyos-extra-v3|cachyos-v4|cachyos-core-v4|cachyos-extra-v4|cachyos-znver4|cachyos-core-znver4|cachyos-extra-znver4)\]$/
     }
+    function is_arch_extra_repo(line) {
+      return line ~ /^\[extra\]$/
+    }
+    function is_arch_multilib_repo(line) {
+      return line ~ /^\[multilib\]$/
+    }
     BEGIN { in_cachyos=0; skip=0 }
     {
       if ($0 ~ /^# CachyOS optimized repositor/) { skip=1; next }
@@ -647,6 +667,8 @@ EOF
       if (is_section($0)) {
         if (in_cachyos) in_cachyos=0
         if (is_cachyos_repo($0)) { in_cachyos=1; next }
+        if (is_arch_extra_repo($0)) { next }
+        if (is_arch_multilib_repo($0)) { next }
       } else if (in_cachyos) next
       print
     }
@@ -656,12 +678,22 @@ EOF
       print "# appended last: artix repos keep priority for shared packages"
       print "[cachyos]"
       print "Include = /etc/pacman.d/cachyos-mirrorlist"
+      print ""
+      print "# Arch Linux extra repository"
+      print "[extra]"
+      print "Include = /etc/pacman.d/arch-extra-mirrorlist"
+      print ""
+      print "# Arch Linux multilib repository (32-bit packages)"
+      print "[multilib]"
+      print "Include = /etc/pacman.d/arch-multilib-mirrorlist"
     }
   ' "$pacman_conf" > "$tmp" || die "failed to update pacman.conf"
   mv "$tmp" "$pacman_conf"
 
   chroot_raw pacman -Sy || die "failed to sync pacman databases"
   chroot_raw pacman -Sl cachyos >/dev/null 2>&1 || die "cachyos repository unavailable"
+  chroot_raw pacman -Sl extra >/dev/null 2>&1 || warn "extra repository unavailable"
+  chroot_raw pacman -Sl multilib >/dev/null 2>&1 || warn "multilib repository unavailable"
 }
 
 # Refresh package list cache for install_pkgs/install_first_found to use
@@ -727,7 +759,7 @@ install_official_packages() {
     sudo cryptsetup btrfs-progs dosfstools e2fsprogs util-linux pciutils \
     curl wget git rsync vim nano fish bash-completion man-db man-pages \
     openssl pkgconf python tzdata pacman-contrib \
-    tlp tlp-pd || true
+    tlp tlp-pd base-devel || true
 
   info "installing runit service packages"
   install_pkgs \
@@ -753,7 +785,7 @@ install_official_packages() {
   install_pkgs \
     bluez bluez-utils blueberry \
     sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza \
-    picom kdeconnect lxsession nwg-look xss-loc fastfetch || true
+    picom kdeconnect lxsession nwg-look xss-loc fastfetch aura || true
 
   info "installing music stack (official repos)"
   install_pkgs mpd ncmpcpp starship || true

@@ -58,7 +58,7 @@ main() {
   info "running dots installer"
   if [[ -x "$HOME_DIR/dots/dots.sh" ]]; then
     sudo -u "$USERNAME" env HOME="$HOME_DIR" XDG_CONFIG_HOME="$HOME_DIR/.config" \
-      bash "$HOME_DIR/dots/dots.sh" || warn "dots.sh failed"
+      bash -c "cd '$HOME_DIR/dots' && ./dots.sh" || warn "dots.sh failed"
   else
     warn "dots.sh not executable"
   fi
