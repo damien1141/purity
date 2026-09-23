@@ -1612,24 +1612,6 @@ EOF
   fi
 }
 
-# Enable autologin on tty1 via a custom runit agetty service.
-configure_autologin() {
-  info "configuring tty1 autologin for $USERNAME"
-
-  mkdir -p "$MOUNT/etc/sv/autologin-tty1"
-  cat > "$MOUNT/etc/sv/autologin-tty1/run" <<EOF
-#!/bin/sh
-exec agetty --autologin $USERNAME --noclear tty1 linux
-EOF
-  chmod +x "$MOUNT/etc/sv/autologin-tty1/run"
-
-  enable_service autologin-tty1
-
-  # Disable any default tty1 getty to avoid conflicts
-  rm -f "$MOUNT/etc/runit/runsvdir/default/agetty-tty1" 2>/dev/null || true
-  rm -f "$MOUNT/etc/runit/runsvdir/default/getty-tty1" 2>/dev/null || true
-}
-
 # Add temporary NOPASSWD sudo for wheel group (needed for aura/jaiba builds as user)
 add_aura_sudoers() {
   mkdir -p "$MOUNT/etc/sudoers.d"
@@ -2086,7 +2068,6 @@ main() {
   create_limine_hook
 
   create_user
-  configure_autologin
   copy_dotfiles
   configure_xresources
 

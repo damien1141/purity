@@ -16,4 +16,4 @@ dbus-update-activation-environment --systemd DBUS_SESSION_BUS_ADDRESS DISPLAY XA
 #xinput set-prop "ELAN0718:00 04F3:30FD Touchpad" "Synaptics Tap Action" 0 0 0 0 1 3 2 &
 
 # Launch awesome
-exec awesome
+exec awesome -c $HOME/.config/awesome/rc.lua
