@@ -1770,7 +1770,7 @@ build_awesome_git() {
   info "building awesome-git (bypassing aura resolver)"
 
   add_aura_sudoers
-  chroot_exec "sudo -u $USERNAME bash -lc 'rm -rf ~/src/awesome-git && git clone https://aur.archlinux.org/awesome-git.git ~/src/awesome-git && cd ~/src/awesome-git && sed -i \"/ldoc/d\" PKGBUILD && sed -i \"s/GENERATE_DOC=ON/GENERATE_DOC=OFF/\" PKGBUILD && makepkg -si --noconfirm --skippgpcheck --nocheck'" || {
+  chroot_exec "sudo -u $USERNAME bash -lc 'rm -rf ~/src/awesome-git && git clone https://aur.archlinux.org/awesome-git.git ~/src/awesome-git && cd ~/src/awesome-git && sed -i \"s/\\x27ldoc\\x27//g\" PKGBUILD && _BUILD_DOCS=0 makepkg -si --noconfirm --skippgpcheck --nocheck'" || {
     remove_aura_sudoers
     FAILED+=("aur: awesome-git")
     return 1
