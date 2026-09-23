@@ -753,7 +753,7 @@ install_official_packages() {
   install_pkgs \
     bluez bluez-utils blueberry \
     sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza \
-    picom kdeconnect lxsession nwg-look xss-loc || true
+    picom kdeconnect lxsession nwg-look xss-loc fastfetch || true
 
   info "installing music stack (official repos)"
   install_pkgs mpd ncmpcpp starship || true
@@ -827,43 +827,11 @@ EOF
 EOF
 }
 
-# Configure system fonts: emoji + material design icons + fontconfig aliases
+# Configure system fonts: fontconfig aliases only
 configure_fonts() {
   info "configuring system fonts"
 
-  # Copy Noto Color Emoji if available
-  mkdir -p "$MOUNT/usr/share/fonts/emoji"
-  if [[ -f "$SCRIPT_DIR/extra/fonts/emoji/NotoColorEmoji.ttf" ]]; then
-    cp "$SCRIPT_DIR/extra/fonts/emoji/NotoColorEmoji.ttf" "$MOUNT/usr/share/fonts/emoji/"
-  else
-    warn "fonts/emoji/NotoColorEmoji.ttf not found, emoji font skipped"
-  fi
-
-  # Copy Material Design Icons if available
-  mkdir -p "$MOUNT/usr/share/fonts/material-design-icons"
-  local md_fonts=(
-    "$SCRIPT_DIR/extra/fonts/material-design-icons/MaterialIcons-Regular.ttf"
-    "$SCRIPT_DIR/extra/fonts/material-design-icons/MaterialIconsOutlined-Regular.otf"
-    "$SCRIPT_DIR/extra/fonts/material-design-icons/MaterialIconsRound-Regular.otf"
-    "$SCRIPT_DIR/extra/fonts/material-design-icons/MaterialIconsSharp-Regular.otf"
-    "$SCRIPT_DIR/extra/fonts/material-design-icons/MaterialIconsTwoTone-Regular.otf"
-  )
-  local md_font_copied=0
-  local f
-  for f in "${md_fonts[@]}"; do
-    if [[ -f "$f" ]]; then
-      cp "$f" "$MOUNT/usr/share/fonts/material-design-icons/"
-      md_font_copied=1
-    fi
-  done
-  if [[ "$md_font_copied" -eq 1 ]]; then
-    info "material design icons installed"
-  else
-    warn "material-design-icons/ not found, material icons skipped"
-  fi
-
   # Fontconfig: prefer HarmonyOS Sans for sans-serif, JetBrains Mono Nerd Font for monospace
-  # Material Icons variants are installed locally and discovered automatically by fontconfig
   cat > "$MOUNT/etc/fonts/conf.d/50-fonts.conf" <<'EOF'
 <?xml version="1.0"?>
 <!DOCTYPE fontconfig SYSTEM "fonts.dtd">
@@ -1531,6 +1499,39 @@ final_snapshot() {
   chroot_raw snapper -c root create --description "post-install" || true
 }
 
+# Create runit service to run post-install.sh once on first boot
+create_postinstall_service() {
+  info "creating post-install runit service"
+
+  local run_dir="$MOUNT/etc/runit/sv/post-install"
+  mkdir -p "$run_dir"
+
+  # Run script: executes post-install.sh, then removes the service so it runs once
+  cat > "$run_dir/run" <<EOF
+#!/usr/bin/env bash
+exec 2>&1
+
+# Wait for network to be ready (NetworkManager + iwd)
+sleep 10
+
+# Run post-install.sh with the created username
+/usr/local/bin/post-install.sh "$USERNAME"
+
+# Disable this service so it runs only once
+rm -f /etc/runit/runsvdir/default/post-install
+sv down post-install 2>/dev/null || true
+exit 0
+EOF
+  chmod +x "$run_dir/run"
+
+  # Copy post-install.sh to target
+  cp "$SCRIPT_DIR/post-install.sh" "$MOUNT/usr/local/bin/post-install.sh"
+  chmod +x "$MOUNT/usr/local/bin/post-install.sh"
+
+  # Enable the service
+  enable_service post-install || true
+}
+
 # Report any failures recorded during installation
 report_failures() {
   if ((${#FAILED[@]})); then
@@ -1629,6 +1630,8 @@ main() {
   create_limine_hook
 
   create_user
+
+  create_postinstall_service
 
   system_update
   configure_dns_final
