@@ -726,7 +726,7 @@ install_official_packages() {
   install_pkgs \
     sudo cryptsetup btrfs-progs dosfstools e2fsprogs util-linux pciutils \
     curl wget git rsync vim nano fish bash-completion man-db man-pages \
-    openssl pkgconf python rustup tzdata pacman-contrib \
+    openssl pkgconf python tzdata pacman-contrib \
     tlp tlp-pd || true
 
   info "installing runit service packages"
