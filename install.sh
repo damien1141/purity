@@ -749,14 +749,10 @@ install_official_packages() {
     xorg-server xorg-xinit xorg-xrandr xorg-xsetroot xorg-xinput xorg-xrdb \
     xorg-xkill xorg-xdpyinfo xterm xorg-fonts-misc ttf-dejavu || true
 
-  info "installing lua + awesomewm"
-  install_pkgs lua lua53 lua53-lgi lua54 lua54-lgi  luarocks || install_pkgs lua luarocks || true
-
   info "installing desktop apps from official repos"
   install_pkgs \
-    thunar kitty obs-studio btop gimp bluez bluez-utils blueberry \
+    bluez bluez-utils blueberry \
     sct argyllcms dispwin xdg-utils xdg-user-dirs gvfs tumbler polkit fontconfig eza \
-    gram obsidian librewolf bun anki \
     picom kdeconnect lxsession nwg-look xss-loc || true
 
   info "installing music stack (official repos)"
