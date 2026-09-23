@@ -605,6 +605,7 @@ preflight_cachyos() {
 
 # Add CachyOS optimized repository (generic x86_64, lowest priority)
 # Also enable Arch extra and multilib repos for additional packages
+# Repo priority order (first = highest): Artix repos > CachyOS > Arch extra > Arch multilib
 configure_repos() {
   info "adding cachyos optimized repository (generic x86_64)"
 
@@ -616,6 +617,7 @@ configure_repos() {
   # generic layout is ONE merged repo: /repo/x86_64/cachyos. there is no
   # cachyos-core / cachyos-extra at this path (404 observed 2026-09-22).
   # packages tagged x86_64/any — stock-pacman safe.
+  # Verified: https://mirror.cachyos.org/repo/x86_64/cachyos/ works (2026-09-23)
   cat > "$mirrorlist_dir/cachyos-mirrorlist" <<'EOF'
 Server = https://cdn77.cachyos.org/repo/x86_64/$repo
 Server = https://us.cachyos.org/repo/x86_64/$repo
@@ -623,7 +625,7 @@ Server = https://at.cachyos.org/repo/x86_64/$repo
 Server = https://mirror.cachyos.org/repo/x86_64/$repo
 EOF
 
-  # Arch extra and multilib mirrorlists
+  # Arch extra and multilib mirrorlists (using Artix mirrors for extra/multilib)
   cat > "$mirrorlist_dir/arch-extra-mirrorlist" <<'EOF'
 Server = https://mirrors.artixlinux.org/archlinux/extra/os/$arch
 Server = https://mirror.rackspace.com/archlinux/extra/os/$arch
@@ -639,6 +641,11 @@ EOF
   local cachyos_key="F3B607488DB35A47"
   chroot_raw pacman-key --recv-keys "$cachyos_key" --keyserver keyserver.ubuntu.com || die "failed to import CachyOS signing key"
   chroot_raw pacman-key --lsign-key "$cachyos_key" || die "failed to sign CachyOS key locally"
+
+  # Install archlinux-keyring for Arch extra/multilib repo verification
+  info "installing archlinux-keyring"
+  chroot_raw pacman -Sy --noconfirm archlinux-keyring || die "failed to install archlinux-keyring"
+  chroot_raw pacman-key --populate archlinux || die "failed to populate archlinux keys"
 
   local backup="$pacman_conf.pre-cachyos"
   if [[ ! -e "$backup" ]]; then
@@ -675,7 +682,7 @@ EOF
     END {
       print ""
       print "# CachyOS optimized repository (generic x86_64, stock-pacman safe)"
-      print "# appended last: artix repos keep priority for shared packages"
+      print "# appended after Artix repos: Artix > CachyOS > Arch extra > Arch multilib"
       print "[cachyos]"
       print "Include = /etc/pacman.d/cachyos-mirrorlist"
       print ""
