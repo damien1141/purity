@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #
 # opinionated artix runit installer
-# target: artix + runit + cachyos bore-lto kernel + limine + luks btrfs
+# target: artix + runit + cachyos bore kernel + limine + luks btrfs
 # destructive. run from artix live as root.
 #
 # This script performs a complete automated installation of Artix Linux with:
 # - runit init system (via artix-runit packages)
-# - CachyOS bore-lto optimized kernel
+# - CachyOS bore optimized kernel (generic x86_64 repo)
 # - Limine bootloader (UEFI + BIOS support)
 # - LUKS2 encrypted root with Argon2id key derivation
 # - Btrfs filesystem with subvolume layout (@, @home, @var, @cache, @log, @tmp, @swap, @snapshots)
@@ -50,6 +50,11 @@ UEFI=0                  # Flag: UEFI boot detected (1) or BIOS (0)
 SSD=0                   # Flag: target disk is SSD/NVMe (1) or HDD (0)
 GPU="unknown"           # Detected GPU vendor: nvidia, amd, intel, or unknown
 MICROCODE="intel-ucode" # CPU microcode package (intel-ucode or amd-ucode)
+# CPU architecture tier: generic | v3 | v4 | znver4
+# generic = baseline x86-64; v3 = AVX2/BMI2; v4 = AVX512; znver4 = Zen4/5 extensions
+CPU_TIER="generic"
+# Whether the detected tier has a real CachyOS repo (1) or only generic exists (0)
+CPU_TIER_REPO=0
 BOOT_PART=""            # Boot partition device path
 ROOT_PART=""            # Root (LUKS) partition device path
 LUKS_UUID=""            # UUID of the LUKS partition (for kernel cmdline)
@@ -167,6 +172,71 @@ detect_hardware() {
 
   info "gpu: $GPU"
   info "microcode: $MICROCODE"
+
+  # CPU architecture tier (CachyOS x86-64-v3/v4/znver4)
+  detect_cpu_tier
+}
+
+# Classify the CPU into a CachyOS architecture tier by flag set.
+#
+# Tiers (in order of specificity):
+#   znver4  Zen 4/5: AVX512 + Zen-specific extensions (clwb, mwaitx, savec, etc.)
+#   v4      x86-64-v4: AVX512 baseline
+#   v3      x86-64-v3: AVX2 + BMI2 (no AVX512)
+#   generic baseline x86-64
+#
+# Repo layout (verified against live mirrors 2026-09-27):
+#   generic   /repo/x86_64/cachyos/cachyos.db            (200, 838 pkgs)
+#   v3        /repo/x86_64_v3/cachyos-v3/cachyos-v3.db  (200, 222 pkgs)
+#   v4        /repo/x86_64_v4/cachyos-v4/cachyos-v4.db  (200, ~220 pkgs)
+#   znver4    /repo/x86_64_v4/cachyos-znver4/cachyos-znver4.db (200)
+#
+# Two gotchas that cost a debug cycle (both confirmed live):
+#   1. the arch token is x86_64_v3 with an UNDERSCORE, not a hyphen. probing
+#      x86_64-v3/ returns 404 on every mirror.
+#   2. the DB filename is <repo>.db (cachyos-v3.db), not cachyos.db. probing
+#      cachyos.db under the v3 path also 404s.
+#   3. the mirrorlist packages ship $arch_v3/$arch_v4 server lines that expand
+#      to the underscore form — pacman handles it, raw curl does not.
+#
+# Detection order mirrors the official cachyos-repo.sh: znver4/5 (gcc native),
+# then x86-64-v4 (ld-linux --help), then v3 fallback.
+detect_cpu_tier() {
+  local flags
+  flags="$(grep -m1 '^flags' /proc/cpuinfo 2>/dev/null || true)"
+
+  # znver4/5: gcc -march=native reports znver4 or znver5
+  if gcc -march=native -Q --help=target 2>/dev/null | grep -qE '\b(znver4|znver5)\b'; then
+    CPU_TIER="znver4"
+  # v4: ld-linux reports x86-64-v4 as supported/searched
+  elif /lib/ld-linux-x86-64.so.2 --help 2>/dev/null | grep -q 'x86-64-v4 (supported, searched)'; then
+    CPU_TIER="v4"
+  elif grep -qE 'avx512f\b' "$flags"; then
+    CPU_TIER="v4"
+  elif grep -qE '\bavx2\b' "$flags"; then
+    CPU_TIER="v3"
+  else
+    CPU_TIER="generic"
+  fi
+
+  info "cpu tier: $CPU_TIER"
+
+  # Probe the real tiered DB for this tier. Generic always exists.
+  local arch_token="" probe_db=""
+  case "$CPU_TIER" in
+    v3)     arch_token="x86_64_v3";  probe_db="https://cdn77.cachyos.org/repo/$arch_token/cachyos-v3/cachyos-v3.db" ;;
+    v4)     arch_token="x86_64_v4";  probe_db="https://cdn77.cachyos.org/repo/$arch_token/cachyos-v4/cachyos-v4.db" ;;
+    znver4) arch_token="x86_64_v4";  probe_db="https://cdn77.cachyos.org/repo/$arch_token/cachyos-znver4/cachyos-znver4.db" ;;
+    *)      CPU_TIER_REPO=0; return 0 ;;
+  esac
+
+  if curl -fsSI "$probe_db" >/dev/null 2>&1; then
+    CPU_TIER_REPO=1
+    info "tiered cachyos repo available for $CPU_TIER ($arch_token)"
+  else
+    CPU_TIER_REPO=0
+    warn "cachyos $CPU_TIER repo unavailable (404) — falling back to generic x86_64"
+  fi
 }
 
 # Prompt user for installation parameters (username, hostname, swap, password, timezone, dnsmasq)
@@ -593,6 +663,7 @@ init_pacman_keys() {
 
 preflight_cachyos() {
   info "preflight: cachyos generic repo reachable"
+  # generic DB is at /repo/x86_64/cachyos/cachyos.db (3-seg path, verified 2026-09-27)
   local m db="/repo/x86_64/cachyos/cachyos.db"
   for m in https://mirror.cachyos.org https://cdn77.cachyos.org https://us.cachyos.org https://at.cachyos.org; do
     if curl -fsSI "$m$db" >/dev/null 2>&1; then
@@ -603,9 +674,24 @@ preflight_cachyos() {
   die "cachyos generic repo 404/unreachable on all mirrors — layout moved again?"
 }
 
-# Add CachyOS optimized repository (generic x86_64, lowest priority)
-# Also enable Arch extra and multilib repos for additional packages
-# Repo priority order (first = highest): Artix repos > CachyOS > Arch extra > Arch multilib
+# Add CachyOS optimized repository(s) to the target pacman config.
+#
+# Repo layout (verified against live mirrors 2026-09-27):
+#   generic   /repo/x86_64/cachyos/cachyos.db            (200, 838 pkgs)
+#   v3        /repo/x86_64_v3/cachyos-v3/cachyos-v3.db  (200, 222 pkgs)
+#   v4        /repo/x86_64_v4/cachyos-v4/cachyos-v4.db  (200, ~220 pkgs)
+#   znver4    /repo/x86_64_v4/cachyos-znver4/cachyos-znver4.db (200)
+#
+# Gotchas that cost a debug cycle (both confirmed live):
+#   1. arch token is x86_64_v3 with an UNDERSCORE, not a hyphen. probing
+#      x86_64-v3/ returns 404 on every mirror.
+#   2. DB filename is <repo>.db (cachyos-v3.db), not cachyos.db.
+#   3. the mirrorlist packages ship $arch_v3/$arch_v4 server lines that expand
+#      to the underscore form — pacman handles it, raw curl does not.
+#
+# detect_cpu_tier probes the real DB for the detected tier. When it 200s,
+# CPU_TIER_REPO=1 and the matching tiered section is injected below; otherwise
+# only the generic repo is configured and tiered packages are skipped.
 configure_repos() {
   info "adding cachyos optimized repository (generic x86_64)"
 
@@ -614,7 +700,7 @@ configure_repos() {
   [[ -f "$pacman_conf" ]] || die "pacman.conf not found in target"
   mkdir -p "$mirrorlist_dir"
 
-  # generic layout is ONE merged repo: /repo/x86_64/cachyos. there is no
+  # generic layout is ONE merged repo: /repo/x86_64/cachyos/. there is no
   # cachyos-core / cachyos-extra at this path (404 observed 2026-09-22).
   # packages tagged x86_64/any — stock-pacman safe.
   # Verified: https://mirror.cachyos.org/repo/x86_64/cachyos/ works (2026-09-23)
@@ -624,6 +710,26 @@ Server = https://us.cachyos.org/repo/x86_64/$repo
 Server = https://at.cachyos.org/repo/x86_64/$repo
 Server = https://mirror.cachyos.org/repo/x86_64/$repo
 EOF
+
+  # Tiered repo: only inject when the DB actually exists for this CPU tier.
+  # Mirrorlists are generated here (not pulled from an asset) because the
+  # server lines are trivial: $arch_v3 expands to x86_64_v3, $arch_v4 to
+  # x86_64_v4. znver4 shares the v4 arch token but its own repo name.
+  local tier_repo="" tier_mirror="" tier_arch_var=""
+  if [[ "$CPU_TIER_REPO" -eq 1 ]]; then
+    case "$CPU_TIER" in
+      v3)     tier_repo="cachyos-v3";     tier_mirror="cachyos-v3-mirrorlist";     tier_arch_var="arch_v3" ;;
+      v4)     tier_repo="cachyos-v4";     tier_mirror="cachyos-v4-mirrorlist";     tier_arch_var="arch_v4" ;;
+      znver4) tier_repo="cachyos-znver4"; tier_mirror="cachyos-znver4-mirrorlist"; tier_arch_var="arch_v4" ;;
+    esac
+    cat > "$mirrorlist_dir/$tier_mirror" <<EOF
+Server = https://cdn77.cachyos.org/repo/\$$tier_arch_var/\$repo
+Server = https://us.cachyos.org/repo/\$$tier_arch_var/\$repo
+Server = https://at.cachyos.org/repo/\$$tier_arch_var/\$repo
+Server = https://mirror.cachyos.org/repo/\$$tier_arch_var/\$repo
+EOF
+    info "wrote $tier_mirror (\$$tier_arch_var)"
+  fi
 
   # Arch extra and multilib mirrorlists (using Artix mirrors for extra/multilib)
   cat > "$mirrorlist_dir/arch-extra-mirrorlist" <<'EOF'
@@ -656,7 +762,7 @@ EOF
   # shared-package ties. never insert mid-file: inserting at [options] put
   # cachyos ahead of artix (observed sync-order bug 2026-09-22).
   local tmp="$pacman_conf.cachyos.new"
-  awk '
+  awk -v tier_repo="$tier_repo" -v tier_mirror="$tier_mirror" '
     function is_section(line) { return line ~ /^\[[^]]+\]$/ }
     function is_cachyos_repo(line) {
       return line ~ /^\[(cachyos|cachyos-core|cachyos-extra|cachyos-v3|cachyos-core-v3|cachyos-extra-v3|cachyos-v4|cachyos-core-v4|cachyos-extra-v4|cachyos-znver4|cachyos-core-znver4|cachyos-extra-znver4)\]$/
@@ -685,6 +791,13 @@ EOF
       print "# appended after Artix repos: Artix > CachyOS > Arch extra > Arch multilib"
       print "[cachyos]"
       print "Include = /etc/pacman.d/cachyos-mirrorlist"
+      if (tier_repo != "") {
+        print ""
+        print "# CachyOS CPU-tier optimized repository (" tier_repo ")"
+        print "# only injected when detect_cpu_tier confirmed the DB is live"
+        print "[" tier_repo "]"
+        print "Include = /etc/pacman.d/" tier_mirror
+      }
       print ""
       print "# Arch Linux extra repository"
       print "[extra]"
@@ -699,6 +812,10 @@ EOF
 
   chroot_raw pacman -Sy || die "failed to sync pacman databases"
   chroot_raw pacman -Sl cachyos >/dev/null 2>&1 || die "cachyos repository unavailable"
+  if [[ "$CPU_TIER_REPO" -eq 1 ]]; then
+    chroot_raw pacman -Sl "$tier_repo" >/dev/null 2>&1 \
+      || warn "$tier_repo repository unavailable — tiered packages will be skipped"
+  fi
   chroot_raw pacman -Sl extra >/dev/null 2>&1 || warn "extra repository unavailable"
   chroot_raw pacman -Sl multilib >/dev/null 2>&1 || warn "multilib repository unavailable"
 }
@@ -756,9 +873,38 @@ install_first_found() {
 # Install all official repository packages by category
 install_official_packages() {
   info "installing kernel"
-  # CachyOS bore-lto optimized kernel (fallback chain)
-  install_first_found linux-cachyos-bore-lto linux-cachyos-bore linux-cachyos linux || die "no kernel found"
-  install_first_found linux-cachyos-bore-lto-headers linux-cachyos-bore-headers linux-cachyos-headers linux-headers || true
+  # Kernel selection is tier-aware. Package naming (verified 2026-09-27 from the
+  # live DBs, NOT assumed):
+  #   v3/v4   linux-cachyos-bore-lto (+ -headers, -nvidia-open)
+  #   znver4  linux-cachyos-bore     (no lto variant in that repo)
+  #   generic linux-cachyos-bore     (the generic repo, no lto variant either)
+  #
+  # Tiered repos do NOT suffix packages with -v3/-v4/-znver4; the tier is baked
+  # into the package's arch field (x86_64_v3 etc.) and the repo name is enough.
+  local kernel_pkg="" kernel_headers_pkg="" nv_kernel_pkg=""
+  if [[ "$CPU_TIER_REPO" -eq 1 ]]; then
+    case "$CPU_TIER" in
+      v3|v4)
+        kernel_pkg="linux-cachyos-bore-lto"
+        kernel_headers_pkg="linux-cachyos-bore-lto-headers"
+        nv_kernel_pkg="linux-cachyos-bore-lto-nvidia-open"
+        ;;
+      znver4)
+        kernel_pkg="linux-cachyos-bore"
+        kernel_headers_pkg="linux-cachyos-bore-headers"
+        nv_kernel_pkg="linux-cachyos-bore-nvidia-open"
+        ;;
+    esac
+  fi
+
+  # Tiered kernel first, then generic bore, then plain cachyos, then arch.
+  # install_first_found walks the list and stops at the first available.
+  install_first_found \
+    "$kernel_pkg" linux-cachyos-bore linux-cachyos linux \
+    || die "no kernel found"
+  install_first_found \
+    "$kernel_headers_pkg" linux-cachyos-bore-headers \
+    linux-cachyos-headers linux-headers || true
   install_pkgs mkinitcpio || true
 
   info "installing core utilities"
@@ -804,10 +950,16 @@ install_official_packages() {
   # GPU-specific packages
   case "$GPU" in
     nvidia)
-      # If using CachyOS kernel, try matching nvidia kernel module packages
+      # If using CachyOS kernel, try matching nvidia kernel module packages.
+      # Verified 2026-09-27: the generic repo ships linux-cachyos-bore-nvidia-open
+      # (not -nvidia). v3/v4 ship linux-cachyos-bore-lto-nvidia-open; znver4 has
+      # no lto variant so it's linux-cachyos-bore-nvidia-open. nv_kernel_pkg
+      # holds the tiered name when CPU_TIER_REPO=1.
       if ls "$MOUNT"/boot/vmlinuz-linux-cachyos* >/dev/null 2>&1; then
         if ! install_first_found \
-          linux-cachyos-bore-lto-nvidia \
+          "$nv_kernel_pkg" \
+          linux-cachyos-bore-lto-nvidia-open \
+          linux-cachyos-bore-nvidia-open \
           linux-cachyos-bore-nvidia \
           linux-cachyos-nvidia; then
           install_pkgs nvidia-dkms || true
