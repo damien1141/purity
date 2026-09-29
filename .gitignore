@@ -1,3 +1,4 @@
 *.log
 home/.config/fish/fish_variables
 home/Vault/.obsidian/plugins/smart-related-notes/
+.kilo

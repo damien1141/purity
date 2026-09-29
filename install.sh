@@ -738,8 +738,10 @@ Server = https://mirror.rackspace.com/archlinux/extra/os/$arch
 Server = https://mirrors.kernel.org/archlinux/extra/os/$arch
 EOF
 
+  # multilib: use the official Arch mirrorlist. Artix mirrors do not reliably
+  # carry Arch's multilib repo, so pointing at them left [multilib] unsyncable.
   cat > "$mirrorlist_dir/arch-multilib-mirrorlist" <<'EOF'
-Server = https://mirrors.artixlinux.org/archlinux/multilib/os/$arch
+Server = https://mirrors.archlinux.org/multilib/os/$arch
 Server = https://mirror.rackspace.com/archlinux/multilib/os/$arch
 Server = https://mirrors.kernel.org/archlinux/multilib/os/$arch
 EOF
