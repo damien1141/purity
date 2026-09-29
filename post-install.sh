@@ -4,7 +4,7 @@ set -Eeuo pipefail
 # Post-install script: optionally clone and run dotfiles installer.
 # If declined, remove X autostart entries if present.
 
-USERNAME="${1:-damien}"
+USERNAME="${1:-${SUDO_USER:-$(id -un)}}"
 HOME_DIR="/home/$USERNAME"
 
 info() { printf '==> %s\n' "$1"; }

@@ -731,9 +731,9 @@ EOF
     info "wrote $tier_mirror (\$$tier_arch_var)"
   fi
 
-  # Arch extra and multilib mirrorlists (using Artix mirrors for extra/multilib)
+  # Arch extra and multilib mirrorlists (official Arch mirrors only)
   cat > "$mirrorlist_dir/arch-extra-mirrorlist" <<'EOF'
-Server = https://mirrors.artixlinux.org/archlinux/extra/os/$arch
+Server = https://mirrors.archlinux.org/extra/os/$arch
 Server = https://mirror.rackspace.com/archlinux/extra/os/$arch
 Server = https://mirrors.kernel.org/archlinux/extra/os/$arch
 EOF
@@ -1692,37 +1692,16 @@ final_snapshot() {
   chroot_raw snapper -c root create --description "post-install" || true
 }
 
-# Create runit service to run post-install.sh once on first boot
-create_postinstall_service() {
-  info "creating post-install runit service"
+# Stage post-install.sh in the user's home directory so they can run it
+# manually (or skip it). No auto-run service: interactive prompts need a
+# real tty, which a runit service cannot provide.
+stage_postinstall() {
+  info "staging post-install.sh in user home"
 
-  local run_dir="$MOUNT/etc/runit/sv/post-install"
-  mkdir -p "$run_dir"
-
-  # Run script: executes post-install.sh, then removes the service so it runs once
-  cat > "$run_dir/run" <<EOF
-#!/usr/bin/env bash
-exec 2>&1
-
-# Wait for network to be ready (NetworkManager + iwd)
-sleep 10
-
-# Run post-install.sh with the created username
-/usr/local/bin/post-install.sh "$USERNAME"
-
-# Disable this service so it runs only once
-rm -f /etc/runit/runsvdir/default/post-install
-sv down post-install 2>/dev/null || true
-exit 0
-EOF
-  chmod +x "$run_dir/run"
-
-  # Copy post-install.sh to target
-  cp "$SCRIPT_DIR/post-install.sh" "$MOUNT/usr/local/bin/post-install.sh"
-  chmod +x "$MOUNT/usr/local/bin/post-install.sh"
-
-  # Enable the service
-  enable_service post-install || true
+  local dest="$MOUNT/home/$USERNAME/post-install.sh"
+  install -Dm755 "$SCRIPT_DIR/post-install.sh" "$dest"
+  chmod +x "$dest"
+  chown "$USERNAME:$(id -gn "$USERNAME")" "$dest" 2>/dev/null || true
 }
 
 # Report any failures recorded during installation
@@ -1824,7 +1803,7 @@ main() {
 
   create_user
 
-  create_postinstall_service
+  stage_postinstall
 
   system_update
   configure_dns_final
