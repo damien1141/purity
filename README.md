@@ -20,6 +20,11 @@ chmod +x run.sh
 ./run.sh
 ```
 
+after first boot- you can choose to install my dots like so:
+``` bash
+./post-install.sh
+```
+
 The script is fully interactive. Prompts for:
 - **Username** (default: `damien`)
 - **Hostname** (default: `artix`)
